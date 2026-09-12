@@ -1,0 +1,308 @@
+:root{
+    --bg:#090a0c;
+    --panel:#101216;
+    --panel2:#14171c;
+    --line:#262a31;
+    --text:#f2f4f7;
+    --muted:#8f98a5;
+    --accent:#d9ff65;
+    --danger:#ff6b6b;
+    --blue:#78a9ff}
+    *{
+        box-sizing:border-box
+    }
+    body {
+    margin: 0;
+    background: #090a0c;
+    color: var(--text);
+    font: 14px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+    .shell {
+    width: 100%;
+    max-width: none;
+    margin: 0;
+    padding: 22px 40px;
+    }
+    .topbar
+    {display:flex;
+        justify-content:space-between;
+        align-items:center;
+        border-bottom:1px solid var(--line)
+        ;padding-bottom:18px
+    }
+    .brand{
+        display:flex;
+        gap:10px;
+        align-items:center
+    }
+    .brand strong{
+        display:block;
+        letter-spacing:.12em;
+        font-size:13px
+    }
+    .brand small{
+        display:block;
+        color:var(--muted);
+        font-size:11px
+    }
+    .mark{
+        display:grid;
+        place-items:center;
+        width:30px;
+        height:30px;
+        border:1px solid #3b414a;
+        border-radius:8px;
+        color:var(--accent);
+        font-weight:800
+    }
+    .hero{
+        padding:76px 0 50px;
+        max-width:760px
+    }
+    .eyebrow,.section-label{
+        color:var(--accent);
+        font-size:10px;
+        letter-spacing:.18em;
+        font-weight:800
+    }
+    .hero h1 {
+    font-size: clamp(56px, 7vw, 96px);
+    line-height: 0.98;
+    letter-spacing: -0.055em;
+    margin: 18px 0;
+    }
+    .hero h1 span{
+        color:#858d98
+    }
+    .hero p{
+        max-width:650px;
+        color:var(--muted);
+        font-size:16px
+    }
+    .card{
+        background:linear-gradient(180deg,#111419,#0e1014);
+        border:1px solid var(--line);
+        border-radius:16px;
+        padding:24px;
+        box-shadow:0 20px 50px #0005
+    }
+    .input-card label{
+        display:block;
+        margin:18px 0 9px;
+        font-weight:700
+    }.input-row{
+        display:flex;
+        gap:10px
+    }
+    .input-row input{
+        flex:1;
+        min-width:0;
+        background:#08090b;
+        border:1px solid #30353d;
+        color:var(--text);
+        border-radius:10px;
+        padding:14px 15px;
+        outline:none
+    }
+    .input-row input:focus{
+        border-color:#707b8a
+    }
+    .button,button{
+        border:0;
+        cursor:pointer
+    }
+    .input-row button,.primary{
+        background:var(--accent);
+        color:#0a0c08;
+        font-weight:800;
+        border-radius:10px;
+        padding:0 18px
+    }
+    .hint{
+        margin-top:10px;
+        color:var(--muted);
+        font-size:12px
+    }
+    .grid.two{
+        display:grid;
+        grid-template-columns:1.25fr .75fr;
+        gap:16px;
+        margin-top:16px
+    }.metric-row{
+        display:flex;
+        gap:34px;
+        border-top:1px solid var(--line);
+        border-bottom:1px solid var(--line);
+        padding:16px 0;margin:20px 0
+    }
+    .metric-row b{
+        display:block;font-size:20px
+    }
+    .metric-row small{
+        color:var(--muted)
+    }
+    .file-list{
+        display:grid;
+        gap:7px
+    }
+    .file{
+        display:flex;
+        justify-content:space-between;
+        gap:10px;
+        background:#0a0c0f;
+        border:1px solid #20242b;
+        padding:9px 11px;
+        border-radius:8px;
+        font-family:ui-monospace,monospace;
+        font-size:11px
+    }
+    .file em{
+        font-style:normal;
+        color:var(--muted)
+    }
+    .stage{
+        display:grid;
+        grid-template-columns:32px 1fr auto;
+        gap:10px;
+        align-items:center;
+        padding:13px 0;
+        border-bottom:1px solid var(--line)
+    }
+    .stage>span{
+        color:#5e6672;
+        font-family:ui-monospace
+    }
+    .stage b{
+        display:block
+    }
+    .stage small{
+        display:block;
+        color:var(--muted);
+        font-size:11px
+    }
+    .stage em{
+        font-style:normal;
+        color:#555d68;
+        font-size:9px;
+        letter-spacing:.1em
+    }
+    .stage.active em{
+        color:var(--accent)
+    }
+    .stage.done em{
+        color:var(--accent)
+    }
+    .stage.fail em{
+        color:var(--danger)
+    }
+    .full{
+        width:100%;
+        height:46px;
+        margin-top:20px
+    }
+    .result-card{
+        margin-top:16px
+    }
+    .result-title{
+        display:flex;
+        justify-content:space-between;
+        align-items:center
+    }
+    .result-title h2{
+        margin:0;
+        font-size:20px
+    }
+    .pill{
+        font-size:10px;
+        padding:5px 8px;
+        border-radius:20px;
+        border:1px solid #343941;
+        color:var(--muted)
+    }
+    .pill.good{
+        color:var(--accent);
+        border-color:#46522d
+    }
+    .pill.bad{
+        color:var(--danger);
+        border-color:#553131
+    }
+    .content{
+        color:#c8cdd5
+    }
+    .code{
+        white-space:pre-wrap;
+        background:#08090b;
+        border:1px solid #242830;
+        border-radius:10px;
+        padding:16px;
+        overflow:auto;
+        font:12px/1.55 ui-monospace,SFMono-Regular,Consolas,monospace
+    }
+    .kv{
+        display:grid;
+        grid-template-columns:150px 1fr;
+        gap:9px;
+        margin-top:18px
+    }
+    .kv b{
+        color:#fff
+    }
+    .kv span{
+        color:var(--muted)
+    }
+    .actions{
+        display:flex;
+        gap:10px;
+        margin-top:16px
+    }
+    .secondary{
+        background:#1a1e24;
+        color:#e6e9ed;
+        border:1px solid #30353d;
+        border-radius:9px;
+                        padding:10px 14px
+    }
+    .hidden{
+        display:none
+    }
+    footer{
+        display:flex;
+        justify-content:space-between;
+        color:#59616d;
+        font-size:10px;
+        letter-spacing:.1em;
+        padding:45px 0 20px;
+        border-top:1px solid var(--line);
+        margin-top:55px
+    }
+    @media(max-width:800px){
+        .grid.two{
+            grid-template-columns:1fr
+        }
+        .input-row{
+            flex-direction:column
+        }
+        .input-row button{
+            height:45px
+        }
+        .hero{
+            padding-top:50px
+        }
+        .hero h1{
+            font-size:56px
+        }
+        .shell{
+            padding:16px
+        }
+        .kv{
+            grid-template-columns:1fr
+        }
+        footer{
+            display:block
+        }
+        footer span{
+            display:block;
+            margin:6px 0
+        }
+    }
