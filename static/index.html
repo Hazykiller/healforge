@@ -13,7 +13,8 @@
 </header>
 <main>
 <section class="hero">
-  <h1>Detect. Diagnose.</h1><h1><span>Patch. Verify.</span></h1>
+  <h1>Detect. Diagnose.</h1>
+  <h1><span>Fix. Verify.</span></h1>
   <p>Turn a failing pull request into an evidence-backed, test-verified repair. AI proposes the fix; the sandbox proves it.</p>
 </section>
 <section class="card input-card">
@@ -21,6 +22,7 @@
   <label for="prUrl">GitHub pull request</label>
   <div class="input-row"><input id="prUrl" placeholder="https://github.com/owner/repository/pull/42" autocomplete="off" /><button id="inspect">Inspect PR <span>→</span></button></div>
   <div id="config" class="hint"></div>
+  <div id="notice" class="notice hidden" role="status" aria-live="polite"></div>
 </section>
 <section id="workspace" class="hidden">
   <div class="grid two">

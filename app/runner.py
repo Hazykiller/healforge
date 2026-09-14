@@ -1,18 +1,22 @@
+from __future__ import annotations
+
+import hashlib
 import json
-import os
 import re
 import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from .config import settings
+from .security import is_sensitive_path, is_safe_repo_path
 
 
-# ---------------------------------------------------------------------------
-# RESULT TYPES
-# ---------------------------------------------------------------------------
+# ============================================================================
+# RESULT / PROJECT MODELS
+# ============================================================================
 
 @dataclass
 class RunResult:
@@ -28,204 +32,329 @@ class ProjectProfile:
     framework: str
     package_manager: str
     test_command: str
-    install_command: str
     docker_image: str
     confidence: float
     evidence: list[str] = field(default_factory=list)
 
 
-# ---------------------------------------------------------------------------
-# PROCESS HELPERS
-# ---------------------------------------------------------------------------
+# ============================================================================
+# CONSTANTS
+# ============================================================================
+
+IGNORED = {
+    ".git",
+    ".venv",
+    "venv",
+    "env",
+    "node_modules",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    ".nox",
+    ".idea",
+    ".vscode",
+    "workspace",
+    "target",
+    "build",
+    "dist",
+    "coverage",
+    ".gradle",
+}
+
+MAX_SOURCE_FILES = 5000
+MAX_OUTPUT_CHARS = 40000
+
+
+# ============================================================================
+# PROCESS EXECUTION
+# ============================================================================
+
+def _decode_output(data: bytes | str | None) -> str:
+    """
+    Decode subprocess output safely on Windows and Linux.
+
+    Docker/Git may emit UTF-8 bytes while Windows PowerShell uses a
+    different console encoding. Never let decoding crash verification.
+    """
+    if data is None:
+        return ""
+
+    if isinstance(data, bytes):
+        return data.decode("utf-8", errors="replace")
+
+    return str(data)
+
 
 def run_process(
     args: list[str],
-    cwd: Path,
+    cwd: Path | None = None,
     timeout: int = 120,
+    env: dict[str, str] | None = None,
 ) -> tuple[int, str]:
+    """
+    Run a process and return (exit_code, output).
+
+    IMPORTANT:
+    cwd and timeout intentionally remain positional-compatible because
+    existing HEALFORGE code calls:
+
+        run_process(command, cwd, timeout)
+
+    This prevents the interface regression that previously broke verify.
+    """
     try:
         completed = subprocess.run(
             args,
-            cwd=cwd,
-            text=True,
+            cwd=str(cwd) if cwd else None,
+            env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             timeout=timeout,
             check=False,
+            text=False,
         )
-        return completed.returncode, completed.stdout[-30000:]
-    except subprocess.TimeoutExpired as exc:
-        return 124, f"Process timed out after {timeout}s: {exc}"
 
+        output = _decode_output(completed.stdout)
+
+        return completed.returncode, output[-MAX_OUTPUT_CHARS:]
+
+    except subprocess.TimeoutExpired as exc:
+        output = _decode_output(exc.stdout)
+
+        return (
+            124,
+            output[-MAX_OUTPUT_CHARS:]
+            + f"\n\nProcess timed out after {timeout} seconds.",
+        )
+
+    except OSError as exc:
+        return 127, f"Failed to start process: {exc}"
+
+
+# ============================================================================
+# DOCKER
+# ============================================================================
 
 def _docker_available() -> bool:
-    return shutil.which("docker") is not None
+    if shutil.which("docker") is None:
+        return False
+
+    code, _ = run_process(
+        ["docker", "info", "--format", "{{.ServerVersion}}"],
+        Path.cwd(),
+        15,
+    )
+
+    return code == 0
 
 
-# ---------------------------------------------------------------------------
-# PROJECT DETECTION
-# ---------------------------------------------------------------------------
+# ============================================================================
+# FILE DISCOVERY
+# ============================================================================
 
-def _read_text(root: Path, name: str, limit: int = 20000) -> str:
+def _read_text(
+    root: Path,
+    name: str,
+    limit: int = 30000,
+) -> str:
     path = root / name
 
     if not path.is_file():
         return ""
 
     try:
-        return path.read_text(encoding="utf-8", errors="ignore")[:limit]
-    except Exception:
+        return path.read_text(
+            encoding="utf-8",
+            errors="replace",
+        )[:limit]
+    except OSError:
         return ""
 
 
-def _has_any(root: Path, names: list[str]) -> bool:
-    return any((root / name).exists() for name in names)
-
-
 def _source_files(root: Path) -> list[Path]:
-    ignored = {
-        ".git",
-        ".venv",
-        "venv",
-        "node_modules",
-        "target",
-        "build",
-        "dist",
-        "__pycache__",
-        ".pytest_cache",
-        "workspace",
-    }
+    result: list[Path] = []
 
-    files: list[Path] = []
+    try:
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
 
-    for path in root.rglob("*"):
-        if not path.is_file():
-            continue
+            try:
+                relative = path.relative_to(root)
+            except ValueError:
+                continue
 
-        if any(part in ignored for part in path.parts):
-            continue
+            if any(
+                part in IGNORED
+                for part in relative.parts
+            ):
+                continue
 
-        files.append(path)
+            if is_sensitive_path(relative.as_posix()):
+                continue
 
-        if len(files) >= 500:
-            break
+            result.append(path)
 
-    return files
+            if len(result) >= MAX_SOURCE_FILES:
+                break
 
+    except OSError:
+        pass
+
+    return result
+
+
+def _has(root: Path, *names: str) -> bool:
+    return any(
+        (root / name).exists()
+        for name in names
+    )
+
+
+# ============================================================================
+# PYTHON DETECTION
+# ============================================================================
 
 def _detect_python(root: Path) -> ProjectProfile | None:
-    markers = [
-        "pyproject.toml",
-        "requirements.txt",
-        "requirements-dev.txt",
-        "setup.py",
-        "setup.cfg",
-        "Pipfile",
-        "poetry.lock",
-        "uv.lock",
-    ]
-
-    source = _source_files(root)
+    files = _source_files(root)
 
     python_files = [
-        p for p in source
-        if p.suffix == ".py"
+        path
+        for path in files
+        if path.suffix == ".py"
     ]
 
-    if not _has_any(root, markers) and not python_files:
+    markers = [
+        name
+        for name in (
+            "pyproject.toml",
+            "requirements.txt",
+            "requirements-dev.txt",
+            "setup.py",
+            "setup.cfg",
+            "Pipfile",
+            "poetry.lock",
+            "uv.lock",
+        )
+        if (root / name).exists()
+    ]
+
+    if not python_files and not markers:
         return None
 
-    pyproject = _read_text(root, "pyproject.toml")
+    pyproject = _read_text(
+        root,
+        "pyproject.toml",
+    ).lower()
+
     requirements = (
         _read_text(root, "requirements.txt")
         + "\n"
         + _read_text(root, "requirements-dev.txt")
-    )
+    ).lower()
 
-    if "django" in pyproject.lower() or "django" in requirements.lower():
+    combined = pyproject + "\n" + requirements
+
+    if "django" in combined:
         framework = "Django"
-    elif "fastapi" in pyproject.lower() or "fastapi" in requirements.lower():
+    elif "fastapi" in combined:
         framework = "FastAPI"
-    elif "flask" in pyproject.lower() or "flask" in requirements.lower():
+    elif "flask" in combined:
         framework = "Flask"
-    elif "pytest" in pyproject.lower() or "pytest" in requirements.lower() or (root / "pytest.ini").exists():
+    elif (
+        "pytest" in combined
+        or _has(root, "pytest.ini", "tox.ini")
+    ):
         framework = "pytest"
     else:
         framework = "Python"
 
-    if (root / "uv.lock").exists():
-        package_manager = "uv"
-        install = "uv sync"
-    elif (root / "poetry.lock").exists():
-        package_manager = "poetry"
-        install = "poetry install --no-interaction"
-    elif (root / "Pipfile").exists():
-        package_manager = "pipenv"
-        install = "pipenv install --dev"
-    elif (root / "requirements.txt").exists():
-        package_manager = "pip"
-        install = "python -m pip install -r requirements.txt"
-    elif (root / "requirements-dev.txt").exists():
-        package_manager = "pip"
-        install = "python -m pip install -r requirements-dev.txt"
-    else:
-        package_manager = "pip"
-        install = "python -m pip install -e ."
-
-    if (
-        (root / "pytest.ini").exists()
+    has_pytest = (
+        "pytest" in combined
+        or _has(root, "pytest.ini", "tox.ini")
         or (root / "tests").is_dir()
-        or "pytest" in pyproject.lower()
-        or "pytest" in requirements.lower()
-    ):
-        test_command = "pytest -q"
-    elif any(p.name.startswith("test_") for p in python_files):
-        test_command = "pytest -q"
+        or any(
+            path.name.startswith("test_")
+            for path in python_files
+        )
+    )
+
+    if has_pytest:
+        test_command = "python -m pytest -q -p no:cacheprovider"
     else:
         test_command = "python -m unittest discover -v"
+
+    if (root / "uv.lock").exists():
+        package_manager = "uv"
+    elif (root / "poetry.lock").exists():
+        package_manager = "poetry"
+    elif (root / "Pipfile").exists():
+        package_manager = "pipenv"
+    else:
+        package_manager = "pip"
+
+    evidence = [
+        f"Python files: {len(python_files)}",
+        *markers,
+    ]
 
     return ProjectProfile(
         language="python",
         framework=framework,
         package_manager=package_manager,
         test_command=test_command,
-        install_command=install,
         docker_image=settings.docker_image_python,
-        confidence=0.98,
-        evidence=[
-            f"Python source files: {len(python_files)}",
-            *[m for m in markers if (root / m).exists()],
-        ],
+        confidence=0.99,
+        evidence=evidence,
     )
 
 
+# ============================================================================
+# NODE / TYPESCRIPT DETECTION
+# ============================================================================
+
 def _detect_node(root: Path) -> ProjectProfile | None:
-    package = root / "package.json"
+    package_file = root / "package.json"
+
+    files = _source_files(root)
 
     js_files = [
-        p for p in _source_files(root)
-        if p.suffix in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}
+        path
+        for path in files
+        if path.suffix.lower()
+        in {
+            ".js",
+            ".jsx",
+            ".ts",
+            ".tsx",
+            ".mjs",
+            ".cjs",
+        }
     ]
 
-    if not package.is_file() and not js_files:
+    if not package_file.is_file() and not js_files:
         return None
 
-    package_text = _read_text(root, "package.json")
+    raw = _read_text(
+        root,
+        "package.json",
+    )
 
     try:
-        package_json = json.loads(package_text) if package_text else {}
+        package = json.loads(raw) if raw else {}
     except json.JSONDecodeError:
-        package_json = {}
+        package = {}
 
-    dependencies = json.dumps(
-        package_json.get("dependencies", {}),
+    dependencies = {
+        **package.get("dependencies", {}),
+        **package.get("devDependencies", {}),
+    }
+
+    combined = json.dumps(
+        dependencies
     ).lower()
-
-    dev_dependencies = json.dumps(
-        package_json.get("devDependencies", {}),
-    ).lower()
-
-    combined = dependencies + dev_dependencies
 
     if "next" in combined:
         framework = "Next.js"
@@ -244,127 +373,142 @@ def _detect_node(root: Path) -> ProjectProfile | None:
 
     if (root / "pnpm-lock.yaml").exists():
         package_manager = "pnpm"
-        install = "corepack enable && pnpm install --frozen-lockfile"
-        runner = "pnpm"
     elif (root / "yarn.lock").exists():
         package_manager = "yarn"
-        install = "corepack enable && yarn install --immutable"
-        runner = "yarn"
-    elif (root / "package-lock.json").exists():
-        package_manager = "npm"
-        install = "npm ci"
-        runner = "npm"
     else:
         package_manager = "npm"
-        install = "npm install"
-        runner = "npm"
 
-    scripts = package_json.get("scripts", {})
+    scripts = package.get("scripts", {})
     test_script = scripts.get("test")
 
     if test_script:
-        test_command = f"{runner} test"
+        test_command = f"{package_manager} test"
     elif "vitest" in combined:
-        test_command = f"{runner} exec vitest run"
+        test_command = f"{package_manager} exec vitest run"
     elif "jest" in combined:
-        test_command = f"{runner} exec jest --runInBand"
+        test_command = f"{package_manager} exec jest --runInBand"
     else:
-        test_command = f"{runner} test"
+        test_command = f"{package_manager} test"
+
+    evidence = [
+        f"JS/TS files: {len(js_files)}",
+        *[
+            name
+            for name in (
+                "package.json",
+                "package-lock.json",
+                "pnpm-lock.yaml",
+                "yarn.lock",
+            )
+            if (root / name).exists()
+        ],
+    ]
 
     return ProjectProfile(
         language="node",
         framework=framework,
         package_manager=package_manager,
         test_command=test_command,
-        install_command=install,
         docker_image=settings.docker_image_node,
-        confidence=0.98,
-        evidence=[
-            f"JavaScript/TypeScript source files: {len(js_files)}",
-            *[
-                name
-                for name in [
-                    "package.json",
-                    "package-lock.json",
-                    "pnpm-lock.yaml",
-                    "yarn.lock",
-                ]
-                if (root / name).exists()
-            ],
-        ],
+        confidence=0.99,
+        evidence=evidence,
     )
 
 
+# ============================================================================
+# JAVA DETECTION
+# ============================================================================
+
 def _detect_java(root: Path) -> ProjectProfile | None:
+    files = _source_files(root)
+
     java_files = [
-        p for p in _source_files(root)
-        if p.suffix == ".java"
+        path
+        for path in files
+        if path.suffix == ".java"
     ]
 
-    if not java_files and not _has_any(
+    if not java_files and not _has(
         root,
-        [
-            "pom.xml",
-            "build.gradle",
-            "build.gradle.kts",
-            "gradlew",
-        ],
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+        "gradlew",
     ):
         return None
 
-    pom = _read_text(root, "pom.xml")
+    pom = _read_text(root, "pom.xml").lower()
+
     gradle = (
-        _read_text(root, "build.gradle")
+        _read_text(root, "build.gradle").lower()
         + "\n"
-        + _read_text(root, "build.gradle.kts")
+        + _read_text(root, "build.gradle.kts").lower()
     )
 
-    combined = (pom + "\n" + gradle).lower()
+    combined = pom + "\n" + gradle
 
-    if "spring-boot" in combined or "springframework" in combined:
-        framework = "Spring Boot"
-    elif "junit" in combined:
-        framework = "JUnit"
-    else:
-        framework = "Java"
+    framework = (
+        "Spring Boot"
+        if "spring-boot" in combined
+        or "springframework" in combined
+        else "Java"
+    )
 
     if (root / "pom.xml").exists():
-        package_manager = "Maven"
-        install = "mvn -q -DskipTests dependency:go-offline"
+        package_manager = "maven"
+
         test_command = "mvn test -q"
-    else:
-        package_manager = "Gradle"
-        install = "./gradlew dependencies --no-daemon"
+
+        docker_image = "maven:3.9-eclipse-temurin-21"
+
+    elif (root / "gradlew").is_file():
+        package_manager = "gradle-wrapper"
+
         test_command = "./gradlew test --no-daemon"
+
+        docker_image = "gradle:8.10-jdk21"
+
+    else:
+        package_manager = "gradle"
+
+        test_command = "gradle test"
+
+        docker_image = "gradle:8.10-jdk21"
 
     return ProjectProfile(
         language="java",
         framework=framework,
         package_manager=package_manager,
         test_command=test_command,
-        install_command=install,
-        docker_image="eclipse-temurin:21-jdk",
+        docker_image=docker_image,
         confidence=0.98,
         evidence=[
-            f"Java source files: {len(java_files)}",
+            f"Java files: {len(java_files)}",
             *[
                 name
-                for name in [
+                for name in (
                     "pom.xml",
                     "build.gradle",
                     "build.gradle.kts",
                     "gradlew",
-                ]
+                )
                 if (root / name).exists()
             ],
         ],
     )
 
 
+# ============================================================================
+# GO DETECTION
+# ============================================================================
+
 def _detect_go(root: Path) -> ProjectProfile | None:
+    files = _source_files(root)
+
     go_files = [
-        p for p in _source_files(root)
-        if p.suffix == ".go"
+        path
+        for path in files
+        if path.suffix == ".go"
     ]
 
     if not go_files and not (root / "go.mod").exists():
@@ -373,22 +517,28 @@ def _detect_go(root: Path) -> ProjectProfile | None:
     return ProjectProfile(
         language="go",
         framework="Go",
-        package_manager="Go Modules",
+        package_manager="go-modules",
         test_command="go test ./...",
-        install_command="go mod download",
         docker_image="golang:1.25-bookworm",
         confidence=0.99,
         evidence=[
-            f"Go source files: {len(go_files)}",
+            f"Go files: {len(go_files)}",
             "go.mod" if (root / "go.mod").exists() else "",
         ],
     )
 
 
+# ============================================================================
+# RUST DETECTION
+# ============================================================================
+
 def _detect_rust(root: Path) -> ProjectProfile | None:
+    files = _source_files(root)
+
     rust_files = [
-        p for p in _source_files(root)
-        if p.suffix == ".rs"
+        path
+        for path in files
+        if path.suffix == ".rs"
     ]
 
     if not rust_files and not (root / "Cargo.toml").exists():
@@ -397,27 +547,42 @@ def _detect_rust(root: Path) -> ProjectProfile | None:
     return ProjectProfile(
         language="rust",
         framework="Cargo",
-        package_manager="Cargo",
+        package_manager="cargo",
         test_command="cargo test",
-        install_command="cargo fetch",
         docker_image="rust:1-bookworm",
         confidence=0.99,
         evidence=[
-            f"Rust source files: {len(rust_files)}",
-            "Cargo.toml" if (root / "Cargo.toml").exists() else "",
+            f"Rust files: {len(rust_files)}",
+            "Cargo.toml",
         ],
     )
 
 
-def _detect_c_cpp(root: Path) -> ProjectProfile | None:
-    source_files = [
-        p for p in _source_files(root)
-        if p.suffix in {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp"}
+# ============================================================================
+# C / C++ DETECTION
+# ============================================================================
+
+def _detect_cpp(root: Path) -> ProjectProfile | None:
+    files = _source_files(root)
+
+    cpp_files = [
+        path
+        for path in files
+        if path.suffix.lower()
+        in {
+            ".c",
+            ".cc",
+            ".cpp",
+            ".cxx",
+            ".h",
+            ".hpp",
+        }
     ]
 
-    if not source_files and not _has_any(
+    if not cpp_files and not _has(
         root,
-        ["CMakeLists.txt", "Makefile"],
+        "CMakeLists.txt",
+        "Makefile",
     ):
         return None
 
@@ -425,46 +590,44 @@ def _detect_c_cpp(root: Path) -> ProjectProfile | None:
         return ProjectProfile(
             language="cpp",
             framework="CMake",
-            package_manager="CMake",
-            test_command="ctest --output-on-failure",
-            install_command="cmake -S . -B build && cmake --build build",
-            docker_image="gcc:15-bookworm",
-            confidence=0.95,
+            package_manager="cmake",
+            test_command="ctest --test-dir build --output-on-failure",
+            docker_image="ubuntu:24.04",
+            confidence=0.96,
             evidence=[
+                f"C/C++ files: {len(cpp_files)}",
                 "CMakeLists.txt",
-                f"C/C++ source files: {len(source_files)}",
             ],
         )
 
     return ProjectProfile(
         language="cpp",
         framework="Make",
-        package_manager="Make",
+        package_manager="make",
         test_command="make test",
-        install_command="make",
-        docker_image="gcc:15-bookworm",
+        docker_image="ubuntu:24.04",
         confidence=0.90,
         evidence=[
+            f"C/C++ files: {len(cpp_files)}",
             "Makefile",
-            f"C/C++ source files: {len(source_files)}",
         ],
     )
 
 
-def detect_project(root: Path) -> tuple[str, str]:
-    profile = detect_project_profile(root)
-
-    return profile.language, profile.test_command
-
+# ============================================================================
+# DYNAMIC PROJECT DETECTION
+# ============================================================================
 
 def detect_project_profile(root: Path) -> ProjectProfile:
-    detectors = [
+    detectors: list[
+        Callable[[Path], ProjectProfile | None]
+    ] = [
         _detect_python,
         _detect_node,
         _detect_java,
         _detect_go,
         _detect_rust,
-        _detect_c_cpp,
+        _detect_cpp,
     ]
 
     matches: list[ProjectProfile] = []
@@ -480,11 +643,12 @@ def detect_project_profile(root: Path) -> ProjectProfile:
 
     if not matches:
         raise RuntimeError(
-            "HEALFORGE could not identify a supported project. "
-            "Supported ecosystems: Python, Node.js/TypeScript, Java, Go, Rust, C/C++."
+            "Unsupported project. "
+            "HEALFORGE supports Python, "
+            "Node.js/TypeScript, Java, Go, Rust "
+            "and C/C++."
         )
 
-    # Prefer explicit build-system markers over loose source extensions.
     priority = {
         "python": 6,
         "node": 5,
@@ -495,9 +659,9 @@ def detect_project_profile(root: Path) -> ProjectProfile:
     }
 
     matches.sort(
-        key=lambda item: (
-            priority.get(item.language, 0),
-            item.confidence,
+        key=lambda profile: (
+            priority.get(profile.language, 0),
+            profile.confidence,
         ),
         reverse=True,
     )
@@ -505,15 +669,36 @@ def detect_project_profile(root: Path) -> ProjectProfile:
     return matches[0]
 
 
-# ---------------------------------------------------------------------------
-# GIT OPERATIONS
-# ---------------------------------------------------------------------------
+def detect_project(root: Path) -> tuple[str, str]:
+    profile = detect_project_profile(root)
+
+    return (
+        profile.language,
+        profile.test_command,
+    )
+
+
+# ============================================================================
+# GIT CHECKOUT
+# ============================================================================
 
 def checkout(
     repo_url: str,
     sha: str,
     destination: Path,
+    pr_number: int | None = None,
 ) -> None:
+    """
+    Checkout the exact PR head commit.
+
+    Compatible with current main.py:
+        checkout(repo_url, sha, root)
+
+    Also supports PR refs when pr_number is supplied.
+    """
+
+    destination = destination.resolve()
+
     if destination.exists():
         shutil.rmtree(destination)
 
@@ -529,6 +714,7 @@ def checkout(
             "--no-tags",
             "--depth",
             "1",
+            "--no-single-branch",
             repo_url,
             str(destination),
         ],
@@ -538,33 +724,66 @@ def checkout(
 
     if code != 0:
         raise RuntimeError(
-            f"git clone failed:\n{output}"
+            f"Git clone failed:\n{output}"
         )
 
-    code, output = run_process(
-        [
-            "git",
-            "fetch",
-            "--depth",
-            "1",
-            "origin",
-            sha,
-        ],
-        destination,
-        120,
-    )
-
-    if code != 0:
-        raise RuntimeError(
-            f"git fetch failed:\n{output}"
+    if pr_number is not None:
+        refspec = (
+            f"pull/{pr_number}/head:"
+            f"refs/remotes/origin/"
+            f"healforge-pr-{pr_number}"
         )
+
+        code, output = run_process(
+            [
+                "git",
+                "fetch",
+                "--depth",
+                "1",
+                "origin",
+                refspec,
+            ],
+            destination,
+            120,
+        )
+
+        if code != 0:
+            raise RuntimeError(
+                f"Git PR fetch failed:\n{output}"
+            )
+
+        target = (
+            f"refs/remotes/origin/"
+            f"healforge-pr-{pr_number}"
+        )
+
+    else:
+        code, output = run_process(
+            [
+                "git",
+                "fetch",
+                "--depth",
+                "1",
+                "origin",
+                sha,
+            ],
+            destination,
+            120,
+        )
+
+        if code != 0:
+            raise RuntimeError(
+                f"Git commit fetch failed:\n{output}"
+            )
+
+        target = sha
 
     code, output = run_process(
         [
             "git",
             "checkout",
             "--detach",
-            sha,
+            target,
         ],
         destination,
         60,
@@ -572,14 +791,61 @@ def checkout(
 
     if code != 0:
         raise RuntimeError(
-            f"git checkout failed:\n{output}"
+            f"Git checkout failed:\n{output}"
         )
 
+
+# ============================================================================
+# PATCH SAFETY
+# ============================================================================
+
+def validate_patch_paths(patch: str) -> None:
+    patterns = (
+        r"(?m)^---\s+[ab]/([^\s]+)",
+        r"(?m)^\+\+\+\s+[ab]/([^\s]+)",
+    )
+
+    for pattern in patterns:
+        for match in re.finditer(
+            pattern,
+            patch,
+        ):
+            path = (
+                match.group(1)
+                .replace("\\", "/")
+                .strip()
+            )
+
+            if path == "/dev/null":
+                continue
+
+            if not is_safe_repo_path(path):
+                raise RuntimeError(
+                    "Patch contains an unsafe path."
+                )
+
+            if is_sensitive_path(path):
+                raise RuntimeError(
+                    "Patch attempts to modify a sensitive file."
+                )
+
+
+# ============================================================================
+# PATCH APPLICATION
+# ============================================================================
 
 def apply_patch(
     root: Path,
     patch_file: Path,
 ) -> tuple[bool, str]:
+
+    patch = patch_file.read_text(
+        encoding="utf-8",
+        errors="replace",
+    )
+
+    validate_patch_paths(patch)
+
     code, output = run_process(
         [
             "git",
@@ -598,6 +864,7 @@ def apply_patch(
         [
             "git",
             "apply",
+            "--whitespace=nowarn",
             str(patch_file),
         ],
         root,
@@ -607,37 +874,57 @@ def apply_patch(
     return code == 0, output
 
 
-# ---------------------------------------------------------------------------
+# ============================================================================
 # DOCKER BUILD CONTEXT
-# ---------------------------------------------------------------------------
+# ============================================================================
 
 def _copy_build_context(
     root: Path,
     destination: Path,
 ) -> None:
-    ignored_names = {
-        ".git",
-        ".venv",
-        "venv",
-        "node_modules",
-        "__pycache__",
-        ".pytest_cache",
-        "workspace",
-        "target",
-        "build",
-        "dist",
-        ".mypy_cache",
-        ".ruff_cache",
-        ".tox",
-        ".idea",
-        ".vscode",
-    }
 
-    def ignore(directory: str, names: list[str]):
-        ignored = []
+    root = root.resolve()
+
+    def ignore(
+        directory: str,
+        names: list[str],
+    ) -> list[str]:
+
+        ignored: list[str] = []
+
+        base = Path(directory)
 
         for name in names:
-            if name in ignored_names:
+            source = base / name
+
+            try:
+                relative = source.relative_to(
+                    root
+                ).as_posix()
+            except ValueError:
+                ignored.append(name)
+                continue
+
+            if name in IGNORED:
+                ignored.append(name)
+                continue
+
+            if is_sensitive_path(relative):
+                ignored.append(name)
+                continue
+
+            if source.is_symlink():
+                ignored.append(name)
+                continue
+
+            try:
+                if (
+                    source.is_file()
+                    and source.stat().st_size
+                    > settings.max_sandbox_file_bytes
+                ):
+                    ignored.append(name)
+            except OSError:
                 ignored.append(name)
 
         return ignored
@@ -646,251 +933,443 @@ def _copy_build_context(
         root,
         destination,
         ignore=ignore,
+        symlinks=False,
     )
 
 
-def _dockerfile_for(profile: ProjectProfile) -> str:
-    language = profile.language
+# ============================================================================
+# DOCKERFILE GENERATION
+# ============================================================================
 
-    if language == "python":
+def _dockerfile_for(
+    profile: ProjectProfile,
+) -> str:
+
+    if profile.language == "python":
+
+        if profile.package_manager == "uv":
+            install = (
+                "python -m pip install "
+                "--no-cache-dir uv && "
+                "uv sync --frozen"
+            )
+
+        elif profile.package_manager == "poetry":
+            install = (
+                "python -m pip install "
+                "--no-cache-dir poetry && "
+                "poetry install --no-interaction"
+            )
+
+        elif profile.package_manager == "pipenv":
+            install = (
+                "python -m pip install "
+                "--no-cache-dir pipenv && "
+                "pipenv install --dev"
+            )
+
+        elif (
+            "requirements.txt"
+            in profile.evidence
+        ):
+            install = (
+                "python -m pip install "
+                "--no-cache-dir "
+                "-r requirements.txt"
+            )
+
+        else:
+            install = "true"
+
         return f"""
 FROM {profile.docker_image}
 
-WORKDIR /work
+WORKDIR /opt/healforge-repo
 
-COPY . /work
+COPY . /opt/healforge-repo
 
-RUN python -m pip install --disable-pip-version-check --no-cache-dir --upgrade pip
+RUN {install}
 
-RUN if [ -f requirements.txt ]; then \
-        python -m pip install --disable-pip-version-check --no-cache-dir -r requirements.txt; \
-    fi
+RUN python -m pip install --no-cache-dir pytest
 
-RUN if [ -f requirements-dev.txt ]; then \
-        python -m pip install --disable-pip-version-check --no-cache-dir -r requirements-dev.txt; \
-    fi
-
-RUN if [ -f pyproject.toml ] && [ ! -f requirements.txt ]; then \
-        python -m pip install --disable-pip-version-check --no-cache-dir -e .; \
-    fi
-
-RUN python -m pip install --disable-pip-version-check --no-cache-dir pytest
+# Runtime verification copies the immutable repository into a disposable
+# writable workspace before executing the test command.
+# cp -a /opt/healforge-repo/. /work/
+# cd /work
 
 CMD ["sh", "-lc", "{profile.test_command}"]
-"""
+""".strip() + "\n"
 
-    if language == "node":
+    if profile.language == "node":
+
         if profile.package_manager == "pnpm":
-            install = "corepack enable && pnpm install --frozen-lockfile"
+            install = (
+                "corepack enable && "
+                "pnpm install --frozen-lockfile"
+            )
+
         elif profile.package_manager == "yarn":
-            install = "corepack enable && yarn install --immutable"
-        else:
+            install = (
+                "corepack enable && "
+                "yarn install --immutable"
+            )
+
+        elif (
+            "package-lock.json"
+            in profile.evidence
+        ):
             install = "npm ci"
+
+        else:
+            install = "npm install"
 
         return f"""
 FROM {profile.docker_image}
 
-WORKDIR /work
+WORKDIR /opt/healforge-repo
 
-COPY . /work
+COPY . /opt/healforge-repo
 
 RUN {install}
 
 CMD ["sh", "-lc", "{profile.test_command}"]
-"""
+""".strip() + "\n"
 
-    if language == "java":
-        if profile.package_manager == "Maven":
-            return f"""
-FROM {profile.docker_image}
+    if profile.language == "java":
 
-WORKDIR /work
+        if profile.package_manager == "maven":
+            install = (
+                "mvn -q -DskipTests "
+                "dependency:go-offline"
+            )
 
-COPY . /work
+        elif profile.package_manager == "gradle-wrapper":
+            install = (
+                "chmod +x gradlew && "
+                "./gradlew dependencies --no-daemon"
+            )
 
-RUN mvn -q -DskipTests dependency:go-offline
-
-CMD ["sh", "-lc", "{profile.test_command}"]
-"""
+        else:
+            install = (
+                "gradle dependencies "
+                "--no-daemon"
+            )
 
         return f"""
 FROM {profile.docker_image}
 
-WORKDIR /work
+WORKDIR /opt/healforge-repo
 
-COPY . /work
+COPY . /opt/healforge-repo
 
-RUN chmod +x gradlew 2>/dev/null || true
-RUN ./gradlew dependencies --no-daemon
+RUN {install}
 
 CMD ["sh", "-lc", "{profile.test_command}"]
-"""
+""".strip() + "\n"
 
-    if language == "go":
+    if profile.language == "go":
+
         return f"""
 FROM {profile.docker_image}
 
-WORKDIR /work
+WORKDIR /opt/healforge-repo
 
-COPY go.mod go.sum* ./
+COPY go.mod ./
+COPY go.sum* ./
 
 RUN go mod download
 
-COPY . /work
+COPY . /opt/healforge-repo
 
 CMD ["sh", "-lc", "{profile.test_command}"]
-"""
+""".strip() + "\n"
 
-    if language == "rust":
+    if profile.language == "rust":
+
         return f"""
 FROM {profile.docker_image}
 
-WORKDIR /work
+WORKDIR /opt/healforge-repo
 
-COPY Cargo.toml Cargo.lock* ./
+COPY Cargo.toml ./
+COPY Cargo.lock* ./
 
 RUN cargo fetch
 
-COPY . /work
+COPY . /opt/healforge-repo
 
 CMD ["sh", "-lc", "{profile.test_command}"]
-"""
+""".strip() + "\n"
 
-    if language == "cpp":
+    if profile.language == "cpp":
+
         return f"""
 FROM {profile.docker_image}
 
-WORKDIR /work
+ENV DEBIAN_FRONTEND=noninteractive
 
-COPY . /work
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        cmake \
+        make \
+        git \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/healforge-repo
+
+COPY . /opt/healforge-repo
 
 RUN if [ -f CMakeLists.txt ]; then \
-        cmake -S . -B build && cmake --build build; \
+        cmake -S . -B build && \
+        cmake --build build; \
     elif [ -f Makefile ]; then \
         make; \
     fi
 
 CMD ["sh", "-lc", "{profile.test_command}"]
-"""
+""".strip() + "\n"
 
     raise RuntimeError(
-        f"Unsupported sandbox language: {language}"
+        f"Unsupported sandbox language: "
+        f"{profile.language}"
     )
 
+
+# ============================================================================
+# CONTENT FINGERPRINT
+# ============================================================================
+
+def _content_fingerprint(
+    root: Path,
+) -> str:
+
+    digest = hashlib.sha256()
+
+    for path in sorted(
+        _source_files(root)
+    ):
+        try:
+            relative = path.relative_to(
+                root
+            ).as_posix()
+        except ValueError:
+            continue
+
+        if is_sensitive_path(relative):
+            continue
+
+        digest.update(
+            relative.encode(
+                "utf-8",
+                errors="replace",
+            )
+        )
+
+        digest.update(b"\0")
+
+        try:
+            digest.update(
+                path.read_bytes()
+            )
+        except OSError:
+            continue
+
+    return digest.hexdigest()[:16]
+
+
+# ============================================================================
+# DOCKER IMAGE BUILD
+# ============================================================================
 
 def _build_sandbox_image(
     root: Path,
     profile: ProjectProfile,
 ) -> tuple[bool, str]:
+
     if not _docker_available():
-        return False, (
+        return (
+            False,
             "Docker is required for sandbox verification. "
-            "Install and start Docker Desktop, then retry."
+            "Start Docker Desktop and retry.",
         )
 
+    fingerprint = _content_fingerprint(
+        root
+    )
+
     image_tag = (
-        "healforge-sandbox-"
-        + re.sub(
-            r"[^a-zA-Z0-9_.-]",
-            "-",
-            profile.language,
-        )
-        + "-"
-        + re.sub(
-            r"[^a-zA-Z0-9_.-]",
-            "-",
-            profile.package_manager.lower(),
-        )
-        + ":latest"
+        f"healforge-sandbox-"
+        f"{profile.language}-"
+        f"{fingerprint}:latest"
     )
 
     with tempfile.TemporaryDirectory(
         prefix="healforge-build-"
     ) as temp:
+
         context = Path(temp)
+
+        repo_context = (
+            context / "repo"
+        )
 
         try:
             _copy_build_context(
                 root,
-                context / "repo",
-            )
-        except Exception as exc:
-            return False, (
-                f"Could not prepare sandbox build context: {exc}"
+                repo_context,
             )
 
-        dockerfile = context / "Dockerfile"
+        except Exception as exc:
+            return (
+                False,
+                "Could not prepare sandbox "
+                f"build context: {exc}",
+            )
+
+        dockerfile = (
+            context / "Dockerfile"
+        )
 
         dockerfile.write_text(
             _dockerfile_for(profile),
             encoding="utf-8",
         )
 
+        build_network = getattr(
+            settings,
+            "sandbox_build_network",
+            "default",
+        )
+
+        timeout = getattr(
+            settings,
+            "sandbox_timeout_seconds",
+            180,
+        )
+
         code, output = run_process(
             [
                 "docker",
                 "build",
-                "--pull",
+                "--network",
+                build_network,
                 "-t",
                 image_tag,
                 "-f",
                 str(dockerfile),
-                str(context / "repo"),
+                str(repo_context),
             ],
             context,
-            600,
+            timeout,
         )
 
         if code != 0:
-            return False, (
+            return (
+                False,
                 "Sandbox image preparation failed.\n\n"
-                + output
+                + output,
             )
 
     return True, image_tag
 
 
-# ---------------------------------------------------------------------------
-# SANDBOX EXECUTION
-# ---------------------------------------------------------------------------
+# ============================================================================
+# SANDBOX RUNTIME
+# ============================================================================
 
 def _run_sandbox(
     image: str,
     command: str,
 ) -> RunResult:
+
+    timeout = getattr(
+        settings,
+        "sandbox_timeout_seconds",
+        180,
+    )
+
+    safe_command = (
+        command
+        .replace(
+            "'",
+            "'\"'\"'",
+        )
+    )
+
+    runtime_command = command
+
+    if command == "pytest -q":
+        runtime_command = "pytest -q -p no:cacheprovider"
+
+    elif command == "python -m pytest -q":
+        runtime_command = "python -m pytest -q -p no:cacheprovider"
+
+    elif command == "gradle test":
+        runtime_command = "gradle test --no-daemon"
+
+    safe_command = (
+        runtime_command
+        .replace("'", "'\"'\"'")
+    )
+
+    runtime_script = (
+        "set -eu; "
+        "mkdir -p /work; "
+        "cp -a /opt/healforge-repo/. /work/; "
+        "cd /work; "
+        f"exec sh -lc '{safe_command}'"
+    )
+
     args = [
         "docker",
         "run",
         "--rm",
 
-        # No outbound network during actual verification.
+        # No network during verification.
         "--network",
         "none",
 
         # Resource limits.
         "--cpus",
         "1.5",
+
         "--memory",
         "768m",
+
         "--pids-limit",
         "128",
 
-        # Immutable container filesystem.
+        # Drop Linux capabilities.
+        "--cap-drop",
+        "ALL",
+
+        # Prevent privilege escalation.
+        "--security-opt",
+        "no-new-privileges:true",
+
+        # Immutable container root.
         "--read-only",
 
+        # Writable disposable workspace.
         "--tmpfs",
-        "/tmp:rw,noexec,nosuid,size=256m",
+        "/work:rw,nosuid,nodev,size=512m",
+
+        # Writable temporary directory but no executable files.
+        "--tmpfs",
+        "/tmp:rw,noexec,nosuid,nodev,size=256m",
 
         image,
+
         "sh",
         "-lc",
-        command,
+        runtime_script,
     ]
 
     code, output = run_process(
         args,
         Path.cwd(),
-        300,
+        timeout,
     )
 
     return RunResult(
@@ -901,35 +1380,34 @@ def _run_sandbox(
     )
 
 
+# ============================================================================
+# MAIN SANDBOX ENTRY POINT
+# ============================================================================
+
 def docker_test(
     root: Path,
     language: str,
     command: str,
 ) -> RunResult:
-    """
-    Build an isolated dependency-ready sandbox and execute the test
-    command without network access.
-
-    The project is detected dynamically and dependencies are prepared
-    during image build. The actual verification phase has networking
-    disabled.
-    """
 
     if not root.exists():
         raise RuntimeError(
-            f"Sandbox repository does not exist: {root}"
+            f"Sandbox repository does not exist: "
+            f"{root}"
         )
 
-    profile = detect_project_profile(root)
+    profile = detect_project_profile(
+        root
+    )
 
-    # The profile discovered during verification must agree with the
-    # language selected by the caller.
-    if profile.language != language:
-        language = profile.language
+    # Detection wins over stale caller information.
+    language = profile.language
 
-    ready, image_or_error = _build_sandbox_image(
-        root,
-        profile,
+    ready, image_or_error = (
+        _build_sandbox_image(
+            root,
+            profile,
+        )
     )
 
     if not ready:

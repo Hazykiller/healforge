@@ -1,19 +1,54 @@
-import json
+import asyncio
+import logging
+import re
 import secrets
 from pathlib import Path
+
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from .config import settings
-from .schemas import InspectRequest, AnalyzeRequest, RepairRequest, PublishRequest
-from .github import GitHubClient, parse_pr_url, RepoRef
-from .context import build_context
-from .ai import AIEngine
-from .runner import checkout, detect_project, apply_patch, docker_test
 
-app = FastAPI(title="HEALFORGE", version="1.0.0")
+from .ai import AIEngine
+from .config import settings
+from .context import build_context, is_sensitive_path
+from .security import is_safe_repo_path, normalize_repo_path
+from .github import GitHubClient, RepoRef, parse_pr_url
+from .runner import apply_patch, checkout, detect_project, docker_test, validate_patch_paths
+from .schemas import AnalyzeRequest, InspectRequest, PublishRequest, RepairRequest
+
+
+app = FastAPI(title="HEALFORGE", version="2.0.0")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 SESSIONS: dict[str, dict] = {}
+logger = logging.getLogger(__name__)
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _workspace_root() -> Path:
+    configured = Path(settings.host_workspace)
+    root = (PROJECT_ROOT / configured).resolve() if not configured.is_absolute() else configured.resolve()
+    try:
+        root.relative_to(PROJECT_ROOT)
+    except ValueError as exc:
+        raise RuntimeError("HOST_WORKSPACE must remain inside the HEALFORGE project directory") from exc
+    return root
+
+
+async def _fetch_contents(gh, ref, paths: list[str], sha: str) -> dict[str, str]:
+    unique = list(dict.fromkeys(paths))
+    if not unique:
+        return {}
+    semaphore = asyncio.Semaphore(max(1, min(settings.github_concurrency, 16)))
+
+    async def fetch(path: str) -> tuple[str, str]:
+        async with semaphore:
+            try:
+                return path, await gh.content(ref, path, sha)
+            except Exception:
+                return path, ""
+
+    results = await asyncio.gather(*(fetch(path) for path in unique))
+    return {path: content for path, content in results if content}
 
 
 def session_or_404(session_id: str) -> dict:
@@ -22,45 +57,282 @@ def session_or_404(session_id: str) -> dict:
         raise HTTPException(404, "Session not found")
     return session
 
+
 @app.get("/")
 def index():
     return FileResponse("static/index.html")
 
+
 @app.get("/api/health")
 def health():
-    return {"ok": True, "github_configured": bool(settings.github_token), "ai_configured": bool(settings.openrouter_api_key)}
+    return {
+        "ok": True,
+        "github_configured": bool(settings.github_token),
+        "ai_configured": bool(settings.openrouter_api_key),
+        "ai_models": settings.ai_models if settings.openrouter_api_key else [],
+        "max_repair_attempts": settings.max_repair_attempts,
+    }
+
+
+def _safe_path(path: str) -> bool:
+    normalized = path.replace("\\", "/")
+    return is_safe_repo_path(normalized) and not is_sensitive_path(normalized)
+
+
+def _path_candidates_from_import(path: str, source: str, tree_paths: set[str]) -> set[str]:
+    result: set[str] = set()
+    suffix = Path(path).suffix.lower()
+    parent = Path(path).parent
+
+    if suffix == ".py":
+        modules = re.findall(
+            r"(?m)^\s*(?:from|import)\s+([A-Za-z_][A-Za-z0-9_.]*)",
+            source,
+        )
+        for module_name in modules:
+            module = module_name.replace(".", "/")
+            possible = {
+                f"{module}.py",
+                f"{module}/__init__.py",
+                (parent / f"{module}.py").as_posix(),
+                (parent / module / "__init__.py").as_posix(),
+            }
+            for candidate in possible:
+                if candidate in tree_paths:
+                    result.add(candidate)
+
+    elif suffix in {".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"}:
+        imports = re.findall(
+            r"(?:from\s+|import\s*\(\s*|require\s*\(\s*)['\"]([^'\"]+)['\"]",
+            source,
+        )
+        extensions = ["", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", "/index.js", "/index.ts"]
+        for imported in imports:
+            if not imported.startswith("."):
+                continue
+            base = (parent / imported).as_posix()
+            for extension in extensions:
+                candidate = base + extension
+                if candidate in tree_paths:
+                    result.add(candidate)
+
+    return result
+
+
+def _score_repository_paths(
+    tree_paths: list[str],
+    changed_paths: list[str],
+) -> list[str]:
+    changed = {p.replace("\\", "/") for p in changed_paths}
+    changed_stems = {Path(p).stem.lower() for p in changed}
+    changed_parents = {str(Path(p).parent).replace("\\", "/") for p in changed}
+
+    metadata = {
+        "pyproject.toml", "requirements.txt", "requirements-dev.txt", "setup.py", "setup.cfg",
+        "pytest.ini", "tox.ini", "package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock",
+        "tsconfig.json", "vite.config.js", "vite.config.ts", "jest.config.js", "jest.config.ts",
+        "vitest.config.js", "vitest.config.ts", "pom.xml", "build.gradle", "build.gradle.kts",
+        "settings.gradle", "settings.gradle.kts", "go.mod", "go.sum", "cargo.toml", "cargo.lock",
+        "cmakelists.txt", "makefile",
+    }
+
+    scored: list[tuple[int, str]] = []
+    for path in tree_paths:
+        if not path or is_sensitive_path(path):
+            continue
+        normalized = path.replace("\\", "/")
+        name = Path(normalized).name.lower()
+        score = 0
+
+        if normalized in changed:
+            score += 1000
+        if normalized.startswith(".github/workflows/"):
+            score += 700
+        if name in metadata:
+            score += 600
+        if str(Path(normalized).parent) in changed_parents:
+            score += 250
+        if name.startswith("test_") or name.endswith("_test.py") or ".test." in name or ".spec." in name or name.endswith("_test.go"):
+            score += 450
+        if any(stem and stem in name for stem in changed_stems):
+            score += 180
+
+        suffix = Path(normalized).suffix.lower()
+        if suffix in {".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".java", ".go", ".rs", ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp"}:
+            score += 80
+
+        if score:
+            scored.append((score, normalized))
+
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [path for _, path in scored]
+
 
 @app.post("/api/inspect")
 async def inspect(req: InspectRequest):
     try:
         ref = parse_pr_url(req.pr_url)
-        gh = GitHubClient(settings.github_token)
-        pr = await gh.pull_request(ref)
-        files = await gh.files(ref)
-        checks_payload = await gh.checks(ref, pr["head"]["sha"])
-        changed_paths = [f["filename"] for f in files if f.get("status") != "removed"]
-        # Pull changed source plus high-signal project metadata. This keeps the context bounded without inventing repository state.
-        candidates = []
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    gh = GitHubClient(settings.github_token, settings.github_timeout_seconds)
+    try:
+        try:
+            pr = await gh.pull_request(ref)
+            head_sha = pr["head"]["sha"]
+            files, checks_payload = await asyncio.gather(
+                gh.files(ref),
+                gh.checks(ref, head_sha),
+            )
+        except Exception as exc:
+            raise HTTPException(502, f"GitHub inspection failed: {str(exc)[:500]}") from exc
+
+        check_runs = checks_payload.get("check_runs", [])
+
+        # Tree retrieval is useful but should not make a valid PR
+        # uninspectable when the tree endpoint is temporarily unavailable.
+        try:
+            tree_objects = await gh.tree(ref, head_sha)
+        except Exception:
+            tree_objects = []
+
+        changed_paths = [
+            f["filename"]
+            for f in files
+            if f.get("status") != "removed" and f.get("filename")
+        ]
+
+        tree_paths = [
+            item.get("path", "")
+            for item in tree_objects
+            if item.get("type") == "blob" and item.get("path")
+        ] or changed_paths[:]
+
+        # Failed-check annotations are independent requests; fetch them with
+        # a small concurrency bound rather than serially.
+        failed_checks = [
+            check for check in check_runs
+            if check.get("conclusion")
+            in {"failure", "cancelled", "timed_out", "action_required"}
+            and check.get("id")
+        ]
+        semaphore = asyncio.Semaphore(max(1, min(settings.github_concurrency, 8)))
+
+        async def annotate(check: dict) -> None:
+            async with semaphore:
+                try:
+                    check["annotations"] = await gh.check_annotations(
+                        ref, int(check["id"])
+                    )
+                except Exception:
+                    check["annotations"] = []
+
+        await asyncio.gather(*(annotate(check) for check in failed_checks))
+
+        tree_set = set(tree_paths)
+        ranked = _score_repository_paths(tree_paths, changed_paths)
+        candidates: list[str] = []
+
+        def add(path: str) -> None:
+            path = normalize_repo_path(path)
+            if not _safe_path(path) or path in candidates:
+                return
+            if len(candidates) < settings.max_repo_candidates:
+                candidates.append(path)
+
+        # Changed files are always highest-value evidence.
         for path in changed_paths:
-            if len(candidates) >= 30:
+            add(path)
+
+        contents = await _fetch_contents(gh, ref, candidates, head_sha)
+
+        for path in ranked:
+            add(path)
+            if len(candidates) >= settings.max_repo_candidates:
                 break
-            candidates.append(path)
-        metadata_names = {"pyproject.toml", "requirements.txt", "package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock", "pytest.ini", "tox.ini"}
-        for name in metadata_names:
-            if name not in candidates:
-                candidates.append(name)
-        contents = {}
-        for path in candidates:
-            try:
-                contents[path] = await gh.content(ref, path, pr["head"]["sha"])
-            except Exception:
-                continue
-        context = build_context(pr, files, checks_payload.get("check_runs", []), contents)
+
+        # Resolve local imports using the actual repository tree.
+        for path in changed_paths:
+            source = contents.get(path, "")
+            for dependency in _path_candidates_from_import(
+                path, source, tree_set
+            ):
+                add(dependency)
+
+        # Pull likely tests even when they were not changed.
+        for path in tree_paths:
+            normalized = path.replace("\\", "/")
+            name = Path(normalized).name.lower()
+            if any(
+                Path(changed).stem.lower() in name
+                for changed in changed_paths
+            ):
+                if (
+                    name.startswith("test_")
+                    or ".test." in name
+                    or ".spec." in name
+                    or name.endswith("_test.go")
+                ):
+                    add(normalized)
+
+        missing = [path for path in candidates if path not in contents]
+        contents.update(
+            await _fetch_contents(gh, ref, missing, head_sha)
+        )
+
+        context = build_context(
+            pr,
+            files,
+            check_runs,
+            contents,
+            tree_paths,
+        )
+
         session_id = secrets.token_urlsafe(12)
-        SESSIONS[session_id] = {"ref": ref, "pr": pr, "files": files, "checks": checks_payload.get("check_runs", []), "contents": contents, "context": context}
-        return {"session_id": session_id, "pr": {"title": pr["title"], "number": pr["number"], "url": pr["html_url"], "head_sha": pr["head"]["sha"]}, "files": [{"path": f["filename"], "status": f["status"], "additions": f["additions"], "deletions": f["deletions"]} for f in files], "checks": [{"name": c["name"], "status": c["status"], "conclusion": c["conclusion"]} for c in checks_payload.get("check_runs", [])], "context_chars": len(context)}
-    except Exception as exc:
-        raise HTTPException(400, str(exc))
+        SESSIONS[session_id] = {
+            "ref": ref,
+            "pr": pr,
+            "files": files,
+            "checks": check_runs,
+            "contents": contents,
+            "context": context,
+            "tree_paths": tree_paths,
+            "repairs": [],
+            "verifications": [],
+        }
+
+        return {
+            "session_id": session_id,
+            "pr": {
+                "title": pr.get("title"),
+                "number": pr.get("number"),
+                "url": pr.get("html_url"),
+                "head_sha": head_sha,
+            },
+            "files": [
+                {
+                    "path": f.get("filename"),
+                    "status": f.get("status"),
+                    "additions": f.get("additions", 0),
+                    "deletions": f.get("deletions", 0),
+                }
+                for f in files
+            ],
+            "checks": [
+                {
+                    "name": c.get("name"),
+                    "status": c.get("status"),
+                    "conclusion": c.get("conclusion"),
+                }
+                for c in check_runs
+            ],
+            "evidence_files": len(contents),
+            "context_chars": len(context),
+        }
+    finally:
+        close = getattr(gh, "aclose", None)
+        if close is not None:
+            await close()
 
 @app.post("/api/analyze")
 def analyze(req: AnalyzeRequest):
@@ -70,104 +342,213 @@ def analyze(req: AnalyzeRequest):
         session["diagnosis"] = diagnosis
         return diagnosis
     except Exception as exc:
-        raise HTTPException(400, str(exc))
+        logger.exception("AI diagnosis failure")
+        raise HTTPException(
+            502,
+            f"AI diagnosis failed safely: {type(exc).__name__}: {str(exc)[:500]}",
+        )
+
 
 @app.post("/api/repair")
 def repair(req: RepairRequest):
     session = session_or_404(req.session_id)
-
     if "diagnosis" not in session:
         raise HTTPException(400, "Run diagnosis first")
 
+    feedback = ""
+    if req.attempt > 1:
+        previous = session.get("verifications", [])
+        if previous:
+            feedback = previous[-1].get("output", "") or previous[-1].get("reason", "")
+
     try:
-        patch = AIEngine().generate_patch(
+        result = AIEngine().generate_patch(
             session["context"],
             session["diagnosis"],
+            session["contents"],
+            feedback,
         )
-
-        session.setdefault("repairs", []).append(patch)
-
-        return patch
-
+        result["attempt"] = req.attempt
+        session.setdefault("repairs", []).append(result)
+        return result
     except Exception as exc:
-        # Keep the error visible to the frontend.
-        # This makes model/parser/validation failures diagnosable
-        # instead of appearing as a mysterious 400.
+        logger.exception("AI repair generation failure")
         raise HTTPException(
-            status_code=422,
-            detail=f"Repair generation failed: {type(exc).__name__}: {exc}",
+            502,
+            f"Repair generation failed safely: {type(exc).__name__}: {str(exc)[:500]}",
         )
+
 
 @app.post("/api/verify")
 def verify(req: RepairRequest):
     session = session_or_404(req.session_id)
+    if req.attempt > settings.max_repair_attempts:
+        raise HTTPException(
+            400,
+            f"Repair attempt {req.attempt} exceeds the configured maximum of "
+            f"{settings.max_repair_attempts}.",
+        )
+
     repairs = session.get("repairs", [])
-    if not repairs:
-        raise HTTPException(400, "Generate a repair first")
-    patch = repairs[-1].get("patch", "")
+    candidates = [
+        r for r in repairs
+        if int(r.get("attempt", 1)) == req.attempt
+    ]
+    repair = candidates[-1] if candidates else None
+
+    if not repair:
+        raise HTTPException(
+            400,
+            f"Generate repair attempt {req.attempt} before verification.",
+        )
+
+    patch = repair.get("patch", "")
     if not patch:
-        return {"passed": False, "reason": "The repair component did not produce a safe patch."}
-    ref: RepoRef = session["ref"]
-    root = Path(settings.host_workspace).resolve() / req.session_id / f"attempt-{req.attempt}"
+        result = {
+            "passed": False,
+            "stage": "repair",
+            "reason": "The AI refused to produce a safe patch.",
+            "attempt": req.attempt,
+        }
+        session.setdefault("verifications", []).append(result)
+        return result
+
     try:
-        checkout(f"https://github.com/{ref.owner}/{ref.repo}.git", session["pr"]["head"]["sha"], root)
-        patch_file = root.parent / "repair.patch"
+        validate_patch_paths(patch)
+    except RuntimeError:
+        raise HTTPException(400, "Repair patch rejected by the safety policy")
+
+    ref: RepoRef = session["ref"]
+    root = _workspace_root() / req.session_id / f"attempt-{req.attempt}"
+
+    try:
+        checkout(
+            f"https://github.com/{ref.owner}/{ref.repo}.git",
+            session["pr"]["head"]["sha"],
+            root,
+        )
+
+        patch_file = root.parent / f"repair-{req.attempt}.patch"
         patch_file.write_text(patch, encoding="utf-8")
         applied, patch_output = apply_patch(root, patch_file)
+
         if not applied:
-            return {"passed": False, "stage": "patch", "output": patch_output}
+            result = {
+                "passed": False,
+                "stage": "patch",
+                "output": patch_output,
+                "attempt": req.attempt,
+            }
+            session.setdefault("verifications", []).append(result)
+            return result
+
         language, command = detect_project(root)
-        result = docker_test(root, language, command)
-        session["verification"] = {"passed": result.passed, "language": language, "command": result.command, "exit_code": result.exit_code, "output": result.output, "root": str(root)}
-        if result.passed:
+        run = docker_test(root, language, command)
+        result = {
+            "passed": run.passed,
+            "stage": "sandbox",
+            "language": language,
+            "command": run.command,
+            "exit_code": run.exit_code,
+            "output": run.output,
+            "attempt": req.attempt,
+            "root": str(root),
+        }
+        session.setdefault("verifications", []).append(result)
+        session["verification"] = result
+
+        if run.passed:
             session["verified_patch"] = patch
-        return session["verification"]
-    except Exception as exc:
-        raise HTTPException(400, str(exc))
+
+        return result
+    except Exception:
+        logger.exception("Unexpected HEALFORGE verification failure")
+        raise HTTPException(500, "HEALFORGE verification error. Check the server logs for safe diagnostics.")
+
 
 @app.get("/api/session/{session_id}")
 def session_state(session_id: str):
     session = session_or_404(session_id)
-    return {k: v for k, v in session.items() if k not in {"context", "contents"}}
+    return {
+        k: v
+        for k, v in session.items()
+        if k not in {"context", "contents", "tree_paths"}
+    }
+
 
 @app.get("/api/session/{session_id}/patch")
 def patch_download(session_id: str):
     session = session_or_404(session_id)
-    patch = session.get("verified_patch") or (session.get("repairs") or [{}])[-1].get("patch", "")
+    patch = session.get("verified_patch")
+    if not patch:
+        repairs = session.get("repairs") or []
+        patch = repairs[-1].get("patch", "") if repairs else ""
+
     if not patch:
         raise HTTPException(404, "No patch available")
-    path = Path(settings.host_workspace).resolve() / f"{session_id}.patch"
+
+    path = _workspace_root() / f"{session_id}.patch"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(patch, encoding="utf-8")
     return FileResponse(path, media_type="text/plain", filename="healforge.patch")
+
 
 @app.post("/api/publish")
 async def publish(req: PublishRequest):
     session = session_or_404(req.session_id)
     if not settings.allow_write_actions:
-        raise HTTPException(403, "Write actions are disabled. Set ALLOW_WRITE_ACTIONS=true only when you intentionally want HEALFORGE to create a branch and PR.")
+        raise HTTPException(
+            403,
+            "Write actions are disabled. Set ALLOW_WRITE_ACTIONS=true only when you intentionally want HEALFORGE to create a branch and PR.",
+        )
+
     verification = session.get("verification", {})
     if not verification.get("passed"):
         raise HTTPException(400, "Only a verified repair can be published")
+
     patch = session.get("verified_patch", "")
     if not patch:
         raise HTTPException(400, "No verified patch")
-    # Publishing is intentionally limited to text files that GitHub can update through the Contents API.
-    import re
-    paths = re.findall(r"^\+\+\+ b/(.+)$", patch, re.MULTILINE)
+
+    paths = re.findall(r"^\+\+\+\s+b/(.+)$", patch, re.MULTILINE)
     paths = list(dict.fromkeys(paths))
     if not paths:
         raise HTTPException(400, "Could not identify patched files")
-    gh = GitHubClient(settings.github_token)
+    if any(not _safe_path(path) for path in paths):
+        raise HTTPException(400, "Patch contains a sensitive or unsafe file path")
+
+    gh = GitHubClient(settings.github_token, settings.github_timeout_seconds)
     ref: RepoRef = session["ref"]
     branch = f"healforge/fix-{session['pr']['number']}-{secrets.token_hex(3)}"
     await gh.create_branch(ref, session["pr"]["head"]["sha"], branch)
+
     for path in paths:
         root = Path(verification["root"]) / path
         if not root.is_file():
             raise HTTPException(400, f"Patched file is not a regular text file: {path}")
-        # Find current blob SHA from the PR head using the API.
-        data = await gh._get(f"/repos/{ref.owner}/{ref.repo}/contents/{path}", {"ref": session["pr"]["head"]["sha"]})
-        await gh.update_file(ref, path, f"HEALFORGE: repair {path}", root.read_text(encoding="utf-8"), data["sha"], branch)
-    created = await gh.create_pr(ref, branch, session["pr"]["base"]["ref"], req.title, req.body)
-    return {"url": created["html_url"], "number": created["number"], "branch": branch}
+
+        data = await gh._get(
+            f"/repos/{ref.owner}/{ref.repo}/contents/{path}",
+            {"ref": session["pr"]["head"]["sha"]},
+        )
+        await gh.update_file(
+            ref,
+            path,
+            f"HEALFORGE: repair {path}",
+            root.read_text(encoding="utf-8"),
+            data["sha"],
+            branch,
+        )
+
+    created = await gh.create_pr(
+        ref,
+        branch,
+        session["pr"]["base"]["ref"],
+        req.title,
+        req.body,
+    )
+    return {
+        "url": created["html_url"],
+        "number": created["number"],
+        "branch": branch,
+    }
