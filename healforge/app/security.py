@@ -1,8 +1,7 @@
 import re
 from pathlib import PurePosixPath
 
-
-_SECRET_FILE_NAMES = {
+_SECRET_FILE_NAMES = frozenset({
     ".env",
     ".env.local",
     ".env.production",
@@ -10,25 +9,22 @@ _SECRET_FILE_NAMES = {
     ".npmrc",
     ".pypirc",
     ".netrc",
+    "credentials.json",
+    "credentials",
     "id_rsa",
     "id_ed25519",
     "id_ecdsa",
-    "credentials.json",
-}
+})
 
-_SECRET_EXTENSIONS = {
-    ".pem",
-    ".key",
-    ".p12",
-    ".pfx",
-    ".jks",
-    ".keystore",
-    ".crt",
-}
+_SECRET_EXTENSIONS = frozenset({
+    ".pem", ".key", ".p12", ".pfx", ".jks", ".keystore", ".crt",
+})
+
+_PRIVATE_PREFIXES = ("id_rsa", "id_ed25519", "id_ecdsa", "private_key")
 
 
 def normalize_repo_path(path: str) -> str:
-    value = path.replace("\\", "/").strip()
+    value = str(path).replace("\\", "/").strip()
     while value.startswith("./"):
         value = value[2:]
     return value
@@ -37,6 +33,8 @@ def normalize_repo_path(path: str) -> str:
 def is_safe_repo_path(path: str) -> bool:
     normalized = normalize_repo_path(path)
     if not normalized or normalized.startswith("/"):
+        return False
+    if "\x00" in normalized:
         return False
     if re.match(r"^[A-Za-z]:", normalized):
         return False
@@ -47,14 +45,14 @@ def is_safe_repo_path(path: str) -> bool:
 def is_sensitive_path(path: str) -> bool:
     normalized = normalize_repo_path(path)
     name = PurePosixPath(normalized).name.lower()
-    secret_names = {item.lower() for item in _SECRET_FILE_NAMES}
-    if name in secret_names:
+
+    if name in _SECRET_FILE_NAMES:
         return True
     if PurePosixPath(name).suffix.lower() in _SECRET_EXTENSIONS:
         return True
     if name.startswith(".env") and name != ".env.example":
         return True
-    if name.startswith(("id_rsa", "id_ed25519", "id_ecdsa", "private_key")):
+    if name.startswith(_PRIVATE_PREFIXES):
         return True
     return False
 

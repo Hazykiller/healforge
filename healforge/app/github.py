@@ -37,6 +37,13 @@ class GitHubClient:
             "X-GitHub-Api-Version": API_VERSION,
             **({"Authorization": f"Bearer {token}"} if token else {}),
         }
+        self._client = httpx.AsyncClient(
+            timeout=self.timeout,
+            headers=self.headers,
+        )
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
 
     async def _request(
         self,
@@ -44,13 +51,11 @@ class GitHubClient:
         path: str,
         **kwargs: Any,
     ) -> Any:
-        async with httpx.AsyncClient(timeout=self.timeout) as client:
-            response = await client.request(
-                method,
-                API + path,
-                headers=self.headers,
-                **kwargs,
-            )
+        response = await self._client.request(
+            method,
+            API + path,
+            **kwargs,
+        )
 
         if response.status_code >= 400:
             detail = response.text[:700].replace("\n", " ")

@@ -1,29 +1,178 @@
+import asyncio
+import json
 import logging
+import os
 import re
 import secrets
+import tempfile
+import time
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from .ai import AIEngine
+from .ai import AIEngine, AIQuotaExhaustedError, AIModelRateLimitError
 from .config import settings
 from .context import build_context, is_sensitive_path
-from .security import is_safe_repo_path
+from .security import is_safe_repo_path, normalize_repo_path
 from .github import GitHubClient, RepoRef, parse_pr_url
-from .runner import apply_patch, checkout, detect_project, docker_test, validate_patch_paths
+from .runner import (
+    apply_patch,
+    checkout,
+    classify_failure,
+    detect_project,
+    detect_project_profile,
+    docker_test,
+    prepare_attempt_workspace,
+    summarize_verification_failure,
+    validate_patch_paths,
+    ProjectProfile,
+)
 from .schemas import AnalyzeRequest, InspectRequest, PublishRequest, RepairRequest
+from .verifier import get_verifier, VerificationResult, UnavailableVerifier
 
 
 app = FastAPI(title="HEALFORGE", version="2.0.0")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 SESSIONS: dict[str, dict] = {}
 logger = logging.getLogger(__name__)
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# Lightweight AI status tracking (Directive 10)
+# Tracks availability without calling the model or wasting quota on health checks.
+_AI_STATUS_CACHE: dict[str, Any] = {
+    "status": "AVAILABLE",
+    "reset_timestamp": None,
+    "remedy_hint": None,
+    "last_checked_at": 0.0,
+    "message": None,
+}
+
+
+def record_ai_success() -> None:
+    _AI_STATUS_CACHE["status"] = "AVAILABLE"
+    _AI_STATUS_CACHE["reset_timestamp"] = None
+    _AI_STATUS_CACHE["remedy_hint"] = None
+    _AI_STATUS_CACHE["last_checked_at"] = time.time()
+    _AI_STATUS_CACHE["message"] = None
+
+
+def record_ai_quota_exhausted(
+    reset_ts: str | None = None,
+    hint: str | None = None,
+    message: str | None = None,
+) -> None:
+    _AI_STATUS_CACHE["status"] = "DAILY_QUOTA_EXHAUSTED"
+    _AI_STATUS_CACHE["reset_timestamp"] = reset_ts
+    _AI_STATUS_CACHE["remedy_hint"] = hint
+    _AI_STATUS_CACHE["last_checked_at"] = time.time()
+    provider = getattr(settings, "ai_provider", "AI").capitalize()
+    _AI_STATUS_CACHE["message"] = message or f"{provider} daily quota is exhausted."
+
+
+def record_ai_temporarily_unavailable(message: str | None = None) -> None:
+    _AI_STATUS_CACHE["status"] = "TEMPORARILY_UNAVAILABLE"
+    _AI_STATUS_CACHE["last_checked_at"] = time.time()
+    _AI_STATUS_CACHE["message"] = message or "AI service is temporarily unavailable."
+
+
+def check_ai_quota_status() -> None:
+    """Raise HTTP 429 if the daily quota is known to be currently exhausted without expiring."""
+    if _AI_STATUS_CACHE["status"] == "DAILY_QUOTA_EXHAUSTED":
+        reset_ts = _AI_STATUS_CACHE.get("reset_timestamp")
+        if reset_ts:
+            try:
+                if float(reset_ts) <= time.time():
+                    _AI_STATUS_CACHE["status"] = "AVAILABLE"
+                    return
+            except (ValueError, TypeError):
+                pass
+        elif time.time() - _AI_STATUS_CACHE.get("last_checked_at", 0) > 3600:
+            _AI_STATUS_CACHE["status"] = "AVAILABLE"
+            return
+
+        provider = getattr(settings, "ai_provider", "openrouter").capitalize()
+        raise HTTPException(
+            429,
+            detail={
+                "error": "AI_QUOTA_EXHAUSTED",
+                "message": f"{provider} free-model daily quota is exhausted. No repair request was attempted further to avoid wasting quota.",
+                "reset_timestamp": _AI_STATUS_CACHE.get("reset_timestamp"),
+                "remedy_hint": _AI_STATUS_CACHE.get("remedy_hint"),
+            },
+        )
+
+
+def _workspace_root() -> Path:
+    if getattr(settings, "is_vercel", False) or bool(os.getenv("VERCEL")):
+        root = Path(tempfile.gettempdir()) / "healforge_workspace"
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+    configured = Path(settings.host_workspace)
+    root = (PROJECT_ROOT / configured).resolve() if not configured.is_absolute() else configured.resolve()
+    try:
+        root.relative_to(PROJECT_ROOT)
+        root.mkdir(parents=True, exist_ok=True)
+        test_file = root / ".write_test"
+        test_file.touch()
+        test_file.unlink()
+    except (ValueError, OSError, PermissionError):
+        root = Path(tempfile.gettempdir()) / "healforge_workspace"
+        root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _save_session(session_id: str, session: dict) -> None:
+    SESSIONS[session_id] = session
+    try:
+        root = _workspace_root()
+        s_dir = root / session_id
+        s_dir.mkdir(parents=True, exist_ok=True)
+        s_path = s_dir / "session.json"
+        serializable = dict(session)
+        if hasattr(serializable.get("ref"), "owner"):
+            serializable["ref"] = {
+                "owner": serializable["ref"].owner,
+                "repo": serializable["ref"].repo,
+                "number": serializable["ref"].number,
+            }
+        s_path.write_text(json.dumps(serializable, default=str), encoding="utf-8")
+    except Exception:
+        pass
+
+
+async def _fetch_contents(gh, ref, paths: list[str], sha: str) -> dict[str, str]:
+    unique = list(dict.fromkeys(paths))
+    if not unique:
+        return {}
+    semaphore = asyncio.Semaphore(max(1, min(settings.github_concurrency, 16)))
+
+    async def fetch(path: str) -> tuple[str, str]:
+        async with semaphore:
+            try:
+                return path, await gh.content(ref, path, sha)
+            except Exception:
+                return path, ""
+
+    results = await asyncio.gather(*(fetch(path) for path in unique))
+    return {path: content for path, content in results if content}
 
 
 def session_or_404(session_id: str) -> dict:
     session = SESSIONS.get(session_id)
+    if not session:
+        try:
+            s_path = _workspace_root() / session_id / "session.json"
+            if s_path.exists():
+                session = json.loads(s_path.read_text(encoding="utf-8"))
+                if isinstance(session.get("ref"), dict):
+                    session["ref"] = RepoRef(**session["ref"])
+                SESSIONS[session_id] = session
+        except Exception as exc:
+            logger.warning("Failed to load session %s from disk: %s", session_id, exc)
     if not session:
         raise HTTPException(404, "Session not found")
     return session
@@ -36,12 +185,36 @@ def index():
 
 @app.get("/api/health")
 def health():
+    ai_configured = settings.is_ai_configured
+    ai_status = "NOT_CONFIGURED"
+    if ai_configured:
+        cached_status = _AI_STATUS_CACHE["status"]
+        if cached_status == "DAILY_QUOTA_EXHAUSTED":
+            reset_ts = _AI_STATUS_CACHE.get("reset_timestamp")
+            if reset_ts:
+                try:
+                    if float(reset_ts) <= time.time():
+                        _AI_STATUS_CACHE["status"] = "AVAILABLE"
+                        cached_status = "AVAILABLE"
+                except (ValueError, TypeError):
+                    pass
+        ai_status = cached_status
+
     return {
         "ok": True,
         "github_configured": bool(settings.github_token),
-        "ai_configured": bool(settings.openrouter_api_key),
-        "ai_models": settings.ai_models if settings.openrouter_api_key else [],
+        "ai_configured": ai_configured,
+        "ai_provider": settings.ai_provider,
+        "ai_status": ai_status,
+        "ai_reset_timestamp": _AI_STATUS_CACHE.get("reset_timestamp"),
+        "ai_remedy_hint": _AI_STATUS_CACHE.get("remedy_hint"),
+        "ai_status_message": _AI_STATUS_CACHE.get("message"),
+        "ai_models": settings.ai_models if ai_configured else [],
         "max_repair_attempts": settings.max_repair_attempts,
+        "verifier_type": settings.verifier_type,
+        "verifier_status": settings.verifier_status,
+        "sandbox_provider": settings.sandbox_provider,
+        "is_vercel": settings.is_vercel,
     }
 
 
@@ -141,93 +314,120 @@ def _score_repository_paths(
 
 @app.post("/api/inspect")
 async def inspect(req: InspectRequest):
+    t_start = time.perf_counter()
     try:
         ref = parse_pr_url(req.pr_url)
-        gh = GitHubClient(settings.github_token, settings.github_timeout_seconds)
-        pr = await gh.pull_request(ref)
-        head_sha = pr["head"]["sha"]
-        files = await gh.files(ref)
-        checks_payload = await gh.checks(ref, head_sha)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    gh = GitHubClient(settings.github_token, settings.github_timeout_seconds)
+    try:
+        try:
+            pr = await gh.pull_request(ref)
+            target_sha = (
+                req.base_sha.strip()
+                if req.base_sha and req.base_sha.strip()
+                else pr["head"]["sha"]
+            )
+            files, checks_payload = await asyncio.gather(
+                gh.files(ref),
+                gh.checks(ref, target_sha),
+            )
+        except Exception as exc:
+            raise HTTPException(502, f"GitHub inspection failed: {str(exc)[:500]}") from exc
+
         check_runs = checks_payload.get("check_runs", [])
 
-        # Add concrete annotations from failed checks when GitHub exposes them.
-        for check in check_runs:
-            if check.get("conclusion") not in {"failure", "cancelled", "timed_out", "action_required"}:
-                continue
-            run_id = check.get("id")
-            if not run_id:
-                continue
-            try:
-                check["annotations"] = await gh.check_annotations(ref, int(run_id))
-            except Exception:
-                check["annotations"] = []
+        # Tree retrieval is useful but should not make a valid PR
+        # uninspectable when the tree endpoint is temporarily unavailable.
+        try:
+            tree_objects = await gh.tree(ref, target_sha)
+        except Exception:
+            tree_objects = []
 
         changed_paths = [
-            f["filename"] for f in files
+            f["filename"]
+            for f in files
             if f.get("status") != "removed" and f.get("filename")
         ]
 
-        try:
-            tree_objects = await gh.tree(ref, head_sha)
-            tree_paths = [
-                item.get("path", "")
-                for item in tree_objects
-                if item.get("type") == "blob"
-            ]
-        except Exception:
-            tree_paths = changed_paths[:]
+        tree_paths = [
+            item.get("path", "")
+            for item in tree_objects
+            if item.get("type") == "blob" and item.get("path")
+        ] or changed_paths[:]
+
+        # Failed-check annotations are independent requests; fetch them with
+        # a small concurrency bound rather than serially.
+        failed_checks = [
+            check for check in check_runs
+            if check.get("conclusion")
+            in {"failure", "cancelled", "timed_out", "action_required"}
+            and check.get("id")
+        ]
+        semaphore = asyncio.Semaphore(max(1, min(settings.github_concurrency, 8)))
+
+        async def annotate(check: dict) -> None:
+            async with semaphore:
+                try:
+                    check["annotations"] = await gh.check_annotations(
+                        ref, int(check["id"])
+                    )
+                except Exception:
+                    check["annotations"] = []
+
+        await asyncio.gather(*(annotate(check) for check in failed_checks))
 
         tree_set = set(tree_paths)
         ranked = _score_repository_paths(tree_paths, changed_paths)
         candidates: list[str] = []
 
         def add(path: str) -> None:
-            path = path.replace("\\", "/").lstrip("./")
+            path = normalize_repo_path(path)
             if not _safe_path(path) or path in candidates:
                 return
             if len(candidates) < settings.max_repo_candidates:
                 candidates.append(path)
 
-        # Always include changed files first.
+        # Changed files are always highest-value evidence.
         for path in changed_paths:
             add(path)
 
-        # Fetch changed files first so imports can be resolved.
-        contents: dict[str, str] = {}
-        for path in candidates:
-            try:
-                contents[path] = await gh.content(ref, path, head_sha)
-            except Exception:
-                continue
+        contents = await _fetch_contents(gh, ref, candidates, target_sha)
 
-        # Add intelligently ranked repository evidence.
         for path in ranked:
             add(path)
             if len(candidates) >= settings.max_repo_candidates:
                 break
 
-        # Resolve local imports from changed files against the actual tree.
+        # Resolve local imports using the actual repository tree.
         for path in changed_paths:
             source = contents.get(path, "")
-            for dependency in _path_candidates_from_import(path, source, tree_set):
+            for dependency in _path_candidates_from_import(
+                path, source, tree_set
+            ):
                 add(dependency)
 
         # Pull likely tests even when they were not changed.
         for path in tree_paths:
             normalized = path.replace("\\", "/")
             name = Path(normalized).name.lower()
-            if any(Path(changed).stem.lower() in name for changed in changed_paths):
-                if name.startswith("test_") or ".test." in name or ".spec." in name or name.endswith("_test.go"):
+            if any(
+                Path(changed).stem.lower() in name
+                for changed in changed_paths
+            ):
+                if (
+                    name.startswith("test_")
+                    or ".test." in name
+                    or ".spec." in name
+                    or name.endswith("_test.go")
+                ):
                     add(normalized)
 
-        # Fetch everything newly selected.
-        for path in candidates:
-            if path in contents:
-                continue
-            try:
-                contents[path] = await gh.content(ref, path, head_sha)
-            except Exception:
-                continue
+        missing = [path for path in candidates if path not in contents]
+        contents.update(
+            await _fetch_contents(gh, ref, missing, target_sha)
+        )
 
         context = build_context(
             pr,
@@ -237,8 +437,9 @@ async def inspect(req: InspectRequest):
             tree_paths,
         )
 
+        inspect_sec = round(time.perf_counter() - t_start, 3)
         session_id = secrets.token_urlsafe(12)
-        SESSIONS[session_id] = {
+        session_data = {
             "ref": ref,
             "pr": pr,
             "files": files,
@@ -246,9 +447,15 @@ async def inspect(req: InspectRequest):
             "contents": contents,
             "context": context,
             "tree_paths": tree_paths,
+            "target_sha": target_sha,
             "repairs": [],
             "verifications": [],
+            "metrics": {
+                "inspect_seconds": inspect_sec,
+                "repairs": {},
+            },
         }
+        _save_session(session_id, session_data)
 
         return {
             "session_id": session_id,
@@ -256,7 +463,7 @@ async def inspect(req: InspectRequest):
                 "title": pr.get("title"),
                 "number": pr.get("number"),
                 "url": pr.get("html_url"),
-                "head_sha": head_sha,
+                "head_sha": target_sha,
             },
             "files": [
                 {
@@ -277,60 +484,142 @@ async def inspect(req: InspectRequest):
             ],
             "evidence_files": len(contents),
             "context_chars": len(context),
+            "metrics": SESSIONS[session_id]["metrics"],
         }
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(400, str(exc))
-
+    finally:
+        close = getattr(gh, "aclose", None)
+        if close is not None:
+            await close()
 
 @app.post("/api/analyze")
 def analyze(req: AnalyzeRequest):
+    t_start = time.perf_counter()
     session = session_or_404(req.session_id)
+    check_ai_quota_status()
     try:
         diagnosis = AIEngine().diagnose(session["context"])
         session["diagnosis"] = diagnosis
+        _save_session(req.session_id, session)
+        record_ai_success()
+        diag_sec = round(time.perf_counter() - t_start, 3)
+        session.setdefault("metrics", {})["diagnosis_seconds"] = diag_sec
+        diagnosis["metrics"] = session["metrics"]
         return diagnosis
+    except HTTPException:
+        raise
+    except AIQuotaExhaustedError as exc:
+        record_ai_quota_exhausted(reset_ts=exc.reset_timestamp, hint=exc.remedy_hint, message=str(exc))
+        raise HTTPException(
+            429,
+            detail={
+                "error": "AI_QUOTA_EXHAUSTED",
+                "message": str(exc),
+                "reset_timestamp": exc.reset_timestamp,
+                "remedy_hint": exc.remedy_hint,
+            },
+        )
     except Exception as exc:
-        raise HTTPException(422, str(exc))
+        logger.exception("AI diagnosis failure")
+        record_ai_temporarily_unavailable(str(exc)[:200])
+        raise HTTPException(
+            502,
+            f"AI diagnosis failed safely: {type(exc).__name__}: {str(exc)[:500]}",
+        )
 
 
 @app.post("/api/repair")
 def repair(req: RepairRequest):
+    t_start = time.perf_counter()
     session = session_or_404(req.session_id)
     if "diagnosis" not in session:
         raise HTTPException(400, "Run diagnosis first")
+
+    check_ai_quota_status()
 
     feedback = ""
     if req.attempt > 1:
         previous = session.get("verifications", [])
         if previous:
-            feedback = previous[-1].get("output", "") or previous[-1].get("reason", "")
+            last_v = previous[-1]
+            raw_out = last_v.get("output", "") or last_v.get("reason", "")
+            feedback = summarize_verification_failure(
+                output=raw_out,
+                exit_code=last_v.get("exit_code"),
+                command=last_v.get("command", ""),
+            )
 
     try:
-        result = AIEngine().generate_patch(
-            session["context"],
-            session["diagnosis"],
-            feedback,
-        )
+        try:
+            result = AIEngine().generate_patch(
+                session["context"],
+                session["diagnosis"],
+                session["contents"],
+                feedback,
+                previous_repairs=session.get("repairs", []),
+            )
+        except TypeError as t_err:
+            if "previous_repairs" in str(t_err):
+                result = AIEngine().generate_patch(
+                    session["context"],
+                    session["diagnosis"],
+                    session["contents"],
+                    feedback,
+                )
+            else:
+                raise
         result["attempt"] = req.attempt
         session.setdefault("repairs", []).append(result)
+        _save_session(req.session_id, session)
+        record_ai_success()
+        rep_sec = round(time.perf_counter() - t_start, 3)
+        session.setdefault("metrics", {}).setdefault("repairs", {}).setdefault(str(req.attempt), {})["generate_seconds"] = rep_sec
+        result["metrics"] = session["metrics"]
         return result
-    except Exception as exc:
+    except HTTPException:
+        raise
+    except AIQuotaExhaustedError as exc:
+        record_ai_quota_exhausted(reset_ts=exc.reset_timestamp, hint=exc.remedy_hint, message=str(exc))
         raise HTTPException(
-            422,
-            f"Repair generation failed: {type(exc).__name__}: {exc}",
+            429,
+            detail={
+                "error": "AI_QUOTA_EXHAUSTED",
+                "message": str(exc),
+                "reset_timestamp": exc.reset_timestamp,
+                "remedy_hint": exc.remedy_hint,
+            },
+        )
+    except Exception as exc:
+        logger.exception("AI repair generation failure")
+        record_ai_temporarily_unavailable(str(exc)[:200])
+        raise HTTPException(
+            502,
+            f"Repair generation failed safely: {type(exc).__name__}: {str(exc)[:500]}",
         )
 
 
 @app.post("/api/verify")
 def verify(req: RepairRequest):
+    t_start = time.perf_counter()
     session = session_or_404(req.session_id)
+    if req.attempt > settings.max_repair_attempts:
+        raise HTTPException(
+            400,
+            f"Repair attempt {req.attempt} exceeds the configured maximum of "
+            f"{settings.max_repair_attempts}.",
+        )
+
     repairs = session.get("repairs", [])
-    candidates = [r for r in repairs if int(r.get("attempt", 1)) == req.attempt]
-    if not candidates:
-        raise HTTPException(400, f"No repair exists for attempt {req.attempt}. Generate that repair first.")
-    repair = candidates[-1]
+    candidates = [
+        r for r in repairs
+        if int(r.get("attempt", 1)) == req.attempt
+    ]
+    repair = candidates[-1] if candidates else None
+
+    if not repair:
+        raise HTTPException(
+            400,
+            f"Generate repair attempt {req.attempt} before verification.",
+        )
 
     patch = repair.get("patch", "")
     if not patch:
@@ -339,6 +628,7 @@ def verify(req: RepairRequest):
             "stage": "repair",
             "reason": "The AI refused to produce a safe patch.",
             "attempt": req.attempt,
+            "metrics": session.get("metrics", {}),
         }
         session.setdefault("verifications", []).append(result)
         return result
@@ -348,15 +638,41 @@ def verify(req: RepairRequest):
     except RuntimeError:
         raise HTTPException(400, "Repair patch rejected by the safety policy")
 
+    # Early exit if no sandbox is available — avoid cloning untrusted code
+    verifier = get_verifier()
+    if isinstance(verifier, UnavailableVerifier):
+        result = {
+            "passed": False,
+            "stage": "sandbox",
+            "status": "SANDBOX_UNAVAILABLE",
+            "verifier_type": "none",
+            "category": "ENVIRONMENT_FAILURE",
+            "output": verifier.reason,
+            "attempt": req.attempt,
+            "metrics": session.get("metrics", {}),
+        }
+        session.setdefault("verifications", []).append(result)
+        session["verification"] = result
+        _save_session(req.session_id, session)
+        return result
+
     ref: RepoRef = session["ref"]
-    root = Path(settings.host_workspace).resolve() / req.session_id / f"attempt-{req.attempt}"
+    session_dir = _workspace_root() / req.session_id
 
     try:
-        checkout(
+        target_sha = (
+            session.get("target_sha")
+            or session["pr"].get("base", {}).get("sha")
+            or session["pr"]["head"]["sha"]
+        )
+        pr_num = session["pr"].get("number") if isinstance(session.get("pr"), dict) else None
+        root = prepare_attempt_workspace(
             f"https://github.com/{ref.owner}/{ref.repo}.git",
-            session["pr"]["head"]["sha"],
-            root,
-            ref.number,
+            target_sha,
+            session_dir,
+            req.attempt,
+            checkout_fn=checkout,
+            pr_number=pr_num,
         )
 
         patch_file = root.parent / f"repair-{req.attempt}.patch"
@@ -364,33 +680,88 @@ def verify(req: RepairRequest):
         applied, patch_output = apply_patch(root, patch_file)
 
         if not applied:
+            v_sec = round(time.perf_counter() - t_start, 3)
+            session.setdefault("metrics", {}).setdefault("repairs", {}).setdefault(str(req.attempt), {})["verify_seconds"] = v_sec
             result = {
                 "passed": False,
                 "stage": "patch",
                 "output": patch_output,
+                "category": "PATCH_FAILURE",
                 "attempt": req.attempt,
+                "metrics": session["metrics"],
             }
             session.setdefault("verifications", []).append(result)
             return result
 
-        language, command = detect_project(root)
-        run = docker_test(root, language, command)
+        language, default_command = detect_project(root)
+
+        # Directive 14: Target the relevant regression test first before broader tests
+        test_command = default_command
+        test_files: list[str] = []
+        for f in session.get("files", []):
+            fn = str(f.get("filename", "")).replace("\\", "/")
+            if fn.endswith((".py", ".js", ".ts", ".go", ".rs", ".java")) and ("test" in fn.lower() or "spec" in fn.lower()):
+                test_files.append(fn)
+
+        if not test_files and session.get("diagnosis"):
+            for aff in session["diagnosis"].get("affected_files", []):
+                aff_norm = str(aff).replace("\\", "/")
+                if "test" in aff_norm.lower() or "spec" in aff_norm.lower():
+                    test_files.append(aff_norm)
+
+        if language == "python" and test_files:
+            target_test = test_files[0]
+            if (root / target_test).exists():
+                test_command = f"python -m pytest -q -p no:cacheprovider -W default {target_test}"
+
+        try:
+            profile = detect_project_profile(root)
+        except Exception:
+            profile = ProjectProfile(
+                language=language or "python",
+                framework="pytest" if language == "python" else "generic",
+                package_manager="pip" if language == "python" else "generic",
+                test_command=test_command,
+                docker_image="python:3.11-slim" if language == "python" else "ubuntu:22.04",
+                confidence=0.5,
+                evidence=["inferred"],
+            )
+        verifier = get_verifier()
+        verif_res: VerificationResult = verifier.verify(
+            root=root,
+            profile=profile,
+            command=test_command,
+            patch=patch,
+            files=session.get("contents"),
+        )
+        v_sec = round(time.perf_counter() - t_start, 3)
+        session.setdefault("metrics", {}).setdefault("repairs", {}).setdefault(str(req.attempt), {})["verify_seconds"] = v_sec
         result = {
-            "passed": run.passed,
+            "passed": verif_res.passed,
             "stage": "sandbox",
-            "language": language,
-            "command": run.command,
-            "exit_code": run.exit_code,
-            "output": run.output,
+            "status": verif_res.status,
+            "language": profile.language,
+            "framework": profile.framework,
+            "package_manager": profile.package_manager,
+            "detected_test_command": profile.test_command,
+            "command": verif_res.command or test_command,
+            "exit_code": verif_res.exit_code,
+            "output": verif_res.output,
+            "category": verif_res.category,
+            "verifier_type": verif_res.verifier_type,
+            "detection_evidence": list(profile.evidence),
             "attempt": req.attempt,
             "root": str(root),
+
+            "metrics": session["metrics"],
         }
         session.setdefault("verifications", []).append(result)
         session["verification"] = result
 
-        if run.passed:
+        if verif_res.passed:
             session["verified_patch"] = patch
 
+        _save_session(req.session_id, session)
         return result
     except Exception:
         logger.exception("Unexpected HEALFORGE verification failure")
@@ -418,7 +789,7 @@ def patch_download(session_id: str):
     if not patch:
         raise HTTPException(404, "No patch available")
 
-    path = Path(settings.host_workspace).resolve() / f"{session_id}.patch"
+    path = _workspace_root() / f"{session_id}.patch"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(patch, encoding="utf-8")
     return FileResponse(path, media_type="text/plain", filename="healforge.patch")

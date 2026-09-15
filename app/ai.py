@@ -288,8 +288,6 @@ class AIEngine:
             )
 
         extra_body: dict[str, Any] = {}
-        if use_router_fallback:
-            extra_body["models"] = list(dict.fromkeys(settings.ai_models))[:2]
 
         response = self.client.chat.completions.create(
             model=model,
@@ -305,7 +303,7 @@ class AIEngine:
             ],
             temperature=temperature,
             timeout=timeout_sec,
-            extra_body=extra_body,
+            extra_body=extra_body if extra_body else None,
         )
 
         choices = getattr(response, "choices", None) or []
