@@ -1,0 +1,25 @@
+[
+  {
+    "instance_id": "matplotlib__matplotlib-23751",
+    "repo_url": "https://github.com/matplotlib/matplotlib",
+    "pr_url": "https://github.com/matplotlib/matplotlib/pull/23751",
+    "base_sha": "de98877e3dc45de8dd441d008f23d88738dc015d",
+    "language": "python",
+    "description": "Fix bar chart invisibility when first element of x/y is NaN (SWE-bench / Matplotlib #23751)."
+  },
+  {
+    "instance_id": "healforge-challenge-python-1",
+    "repo_url": "https://github.com/Hazykiller/healforge-challenge-python",
+    "pr_url": "https://github.com/Hazykiller/healforge-challenge-python/pull/1",
+    "language": "python",
+    "description": "HEALFORGE Python verification challenge PR."
+  },
+  {
+    "instance_id": "psf__requests-2931",
+    "repo_url": "https://github.com/psf/requests",
+    "pr_url": "https://github.com/psf/requests/pull/2931",
+    "base_sha": "5f7a3a74aab1625c2bb65f643197ee885e3da576",
+    "language": "python",
+    "description": "Requests parameter handling regression fix."
+  }
+]

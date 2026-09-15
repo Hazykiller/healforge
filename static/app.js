@@ -16,11 +16,31 @@ async function api(path, options = {}) {
   const data = await response.json().catch(() => ({}));
 
   if (!response.ok) {
-    throw new Error(
-      data.detail ||
-      data.message ||
-      `Request failed (${response.status})`
-    );
+    let errorMsg = `Request failed (${response.status})`;
+    if (data && typeof data.detail === "object" && data.detail !== null) {
+      if (data.detail.error === "AI_QUOTA_EXHAUSTED") {
+        let msg = "AI SERVICE LIMITED: OpenRouter's current free-model quota has been exhausted. No repair request was attempted further to avoid wasting quota.";
+        if (data.detail.reset_timestamp) {
+          try {
+            const resetDate = new Date(Number(data.detail.reset_timestamp) * 1000);
+            if (!isNaN(resetDate.getTime())) {
+              msg += ` (Reset expected at ${resetDate.toLocaleTimeString()})`;
+            }
+          } catch (_) {}
+        }
+        if (data.detail.remedy_hint) {
+          msg += ` Hint: ${data.detail.remedy_hint}`;
+        }
+        errorMsg = msg;
+      } else {
+        errorMsg = data.detail.message || JSON.stringify(data.detail);
+      }
+    } else if (typeof data.detail === "string") {
+      errorMsg = data.detail;
+    } else if (data.message) {
+      errorMsg = data.message;
+    }
+    throw new Error(errorMsg);
   }
 
   return data;
@@ -210,7 +230,20 @@ async function recover() {
     }
   } catch (error) {
     setStage(currentStage, "fail", "ERROR");
-    showError(error.message);
+    let msg = error.message || "An unexpected error occurred.";
+    if (msg.includes("AI_QUOTA_EXHAUSTED") || msg.includes("free-models-per-day") || msg.includes("daily quota")) {
+      msg = "AI SERVICE LIMITED: OpenRouter's current free-model quota has been exhausted. No repair request was attempted further to avoid wasting quota.";
+    } else if (msg.includes("No safe edit plan was produced") || msg.includes("missing valid 'edits'")) {
+      const cleanDetails = msg.replace(/^.*No safe edit plan was produced after all repair model attempts:\s*/i, "");
+      msg = cleanDetails ? `PATCH GENERATION FAILED: ${cleanDetails}` : "PATCH GENERATION FAILED: No valid semantic edit plan was produced by the configured repair models.";
+    } else if (msg.includes("Rate limit exceeded") || msg.includes("429")) {
+      msg = "AI SERVICE RATE LIMITED: The configured AI provider rate limit has been reached.";
+    }
+    // Defense-in-depth: strip any token/key patterns
+    msg = msg.replace(/bearer\s+[A-Za-z0-9_\-\.]+/gi, "bearer [REDACTED]");
+    msg = msg.replace(/(?:sk-|ghp_|github_pat_)[A-Za-z0-9_\-\.]+/gi, "[REDACTED]");
+    msg = msg.replace(/key=[A-Za-z0-9_\-\.]+/gi, "key=[REDACTED]");
+    showError(msg);
   } finally {
     button.disabled = false;
     button.textContent = "Run recovery";
@@ -220,12 +253,13 @@ async function recover() {
 function renderDiagnosis(diagnosis) {
   const confidence = Number(diagnosis.confidence || 0);
   const evidence = Array.isArray(diagnosis.evidence) ? diagnosis.evidence : [diagnosis.evidence].filter(Boolean);
+  const duration = diagnosis.metrics?.diagnosis_seconds ? ` · ${diagnosis.metrics.diagnosis_seconds}s` : "";
 
   $("diagnosisCard").classList.remove("hidden");
   $("diagnosisCard").innerHTML = `
     <div class="result-title">
       <h2>Root-cause diagnosis</h2>
-      <span class="pill good">${Math.round(confidence * 100)}% confidence</span>
+      <span class="pill good">${Math.round(confidence * 100)}% confidence${duration}</span>
     </div>
     <div class="kv">
       <b>Summary</b><span>${escapeHtml(diagnosis.summary)}</span>
@@ -238,14 +272,27 @@ function renderDiagnosis(diagnosis) {
 
 function renderRepair(repair, attempt) {
   const confidence = Number(repair.confidence || 0);
+  const duration = repair.metrics?.generate_seconds ? ` · ${repair.metrics.generate_seconds}s` : "";
+  const hypothesis = repair.hypothesis ? `<b>Hypothesis</b><span>${escapeHtml(repair.hypothesis)}</span>` : "";
+  const strategy = repair.strategy ? `<b>Strategy</b><span>${escapeHtml(repair.strategy)}</span>` : "";
+  const whyFailed = repair.why_previous_failed ? `
+    <div class="hint" style="color: var(--accent); margin-top: 10px;">
+      <b>Prior attempt analysis:</b> ${escapeHtml(repair.why_previous_failed)}
+    </div>` : "";
+
   $("patchCard").classList.remove("hidden");
   $("patchCard").innerHTML = `
     <div class="result-title">
       <h2>Candidate repair · attempt ${attempt}</h2>
-      <span class="pill">${Math.round(confidence * 100)}% confidence</span>
+      <span class="pill">${Math.round(confidence * 100)}% confidence${duration}</span>
     </div>
-    <p class="content">${escapeHtml(repair.explanation)}</p>
-    <pre class="code">${escapeHtml(repair.patch || "No safe patch generated.")}</pre>
+    <div class="kv">
+      ${hypothesis}
+      ${strategy}
+      <b>Summary</b><span>${escapeHtml(repair.explanation || repair.summary || "Structured repair generated")}</span>
+    </div>
+    ${whyFailed}
+    <pre class="code" style="margin-top: 12px;">${escapeHtml(repair.patch || "No safe patch generated.")}</pre>
     <div class="actions">
       <a class="secondary" href="/api/session/${encodeURIComponent(sessionId)}/patch">Download patch</a>
     </div>
@@ -254,6 +301,7 @@ function renderRepair(repair, attempt) {
 
 function renderVerification(verification, attempt) {
   const verified = Boolean(verification.passed);
+  const duration = verification.metrics?.verify_seconds ? ` · ${verification.metrics.verify_seconds}s` : "";
   const command = escapeHtml(verification.command || "Verification command unavailable");
   const output = escapeHtml(verification.output || verification.reason || "No verification output returned.");
   const exitCode = verification.exit_code == null ? "—" : escapeHtml(verification.exit_code);
@@ -262,14 +310,14 @@ function renderVerification(verification, attempt) {
   $("verifyCard").innerHTML = `
     <div class="result-title">
       <h2>Sandbox verification · attempt ${attempt}</h2>
-      <span class="pill ${verified ? "good" : "bad"}">${verified ? "VERIFIED" : "REJECTED"}</span>
+      <span class="pill ${verified ? "good" : "bad"}">${verified ? "VERIFIED" : "REJECTED"}${duration}</span>
     </div>
     <div class="kv">
       <b>Test command</b><span>${command}</span>
       <b>Exit code</b><span>${exitCode}</span>
     </div>
     <pre class="code">${output}</pre>
-    ${verified ? `<div class="actions"><a class="secondary" href="/api/session/${encodeURIComponent(sessionId)}/patch">Download verified patch</a></div>` : `<div class="hint">The sandbox rejected this candidate. The next attempt receives this failure output.</div>`}
+    ${verified ? `<div class="actions"><a class="secondary" href="/api/session/${encodeURIComponent(sessionId)}/patch">Download verified patch</a></div>` : `<div class="hint">The sandbox rejected this candidate. The next attempt receives this failure output and re-evaluates from clean repository state.</div>`}
   `;
 }
 
@@ -297,10 +345,27 @@ document.addEventListener("DOMContentLoaded", () => {
     .then((health) => {
       const config = $("config");
       if (!config) return;
-      config.textContent = health.ai_configured
-        ? `AI ready · ${health.ai_models?.length || 1} model route(s)`
-        : "AI key missing";
-      config.style.color = "";
+      const providerName = (health.ai_provider === "gemini") ? "Gemini" : "OpenRouter";
+      if (!health.ai_configured) {
+        config.textContent = `${providerName} key missing`;
+        config.style.color = "#ff6b6b";
+      } else if (health.ai_status === "DAILY_QUOTA_EXHAUSTED") {
+        config.textContent = `${providerName} quota exhausted`;
+        config.style.color = "#ffa94d";
+      } else if (health.ai_status === "TEMPORARILY_UNAVAILABLE") {
+        config.textContent = `${providerName} status: Temporarily unavailable`;
+        config.style.color = "#ffa94d";
+      } else {
+        const primaryModel = health.ai_models?.[0] || "default";
+        let verifierLabel = "Docker (Local)";
+        if (health.verifier_type === "remote") {
+          verifierLabel = "Remote Sandbox";
+        } else if (health.verifier_type === "none") {
+          verifierLabel = "Sandbox Unavailable";
+        }
+        config.textContent = `AI: ${providerName} (${primaryModel}) · VERIFIER: ${verifierLabel}`;
+        config.style.color = "";
+      }
     })
     .catch((error) => showError(error.message));
 });

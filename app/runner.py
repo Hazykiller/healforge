@@ -24,6 +24,59 @@ class RunResult:
     command: str
     exit_code: int
     output: str
+    category: str = ""
+
+
+def classify_failure(run: RunResult) -> str:
+    """
+    Classify execution failure into actionable categories:
+    - 'PATCH_FAILURE': test assertion failures, logic errors
+    - 'ENVIRONMENT_FAILURE': missing packages, system libs, python module not found
+    - 'TIMEOUT': process or container timed out
+    - 'COMPILATION_FAILURE': syntax error, indent error, compilation error
+    - 'INFRASTRUCTURE_FAILURE': docker daemon or OS runner crashes
+    """
+    if run.passed:
+        return "SUCCESS"
+
+    if run.exit_code == 124 or "timed out after" in run.output.lower() or "timeout" in run.output.lower():
+        return "TIMEOUT"
+
+    out_lower = run.output.lower()
+
+    # Environment failure patterns: missing dependencies, bad python env, missing system tools
+    env_indicators = (
+        "modulenotfounderror",
+        "no module named",
+        "importerror: cannot import name",
+        "environment not ready",
+        "command not found",
+        "executable file not found",
+        "error: metadata-generation-failed",
+        "fatal error: python.h: no such file",
+    )
+    if any(ind in out_lower for ind in env_indicators):
+        return "ENVIRONMENT_FAILURE"
+
+    # Compilation / syntax errors
+    syntax_indicators = (
+        "syntaxerror:",
+        "indentationerror:",
+        "taberror:",
+        "fatal error:",
+        "compilation error",
+        "error: expected ';'",
+        "error: undefined reference to",
+    )
+    if any(ind in out_lower for ind in syntax_indicators):
+        return "COMPILATION_FAILURE"
+
+    # Infrastructure failures
+    if run.exit_code == 127 or "cannot connect to the docker daemon" in out_lower or "oomkilled" in out_lower:
+        return "INFRASTRUCTURE_FAILURE"
+
+    return "PATCH_FAILURE"
+
 
 
 @dataclass
@@ -682,6 +735,32 @@ def detect_project(root: Path) -> tuple[str, str]:
 # GIT CHECKOUT
 # ============================================================================
 
+def _safe_rmtree(path: Path) -> None:
+    """Windows-safe directory tree removal handling read-only git files."""
+    if not path.exists():
+        return
+    import stat
+    try:
+        for p in path.rglob("*"):
+            try:
+                p.chmod(stat.S_IWRITE | stat.S_IREAD)
+            except Exception:
+                pass
+        path.chmod(stat.S_IWRITE | stat.S_IREAD)
+    except Exception:
+        pass
+    def _onerror(func, p, _):
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+        except Exception:
+            pass
+    try:
+        shutil.rmtree(path, onerror=_onerror)
+    except Exception:
+        shutil.rmtree(path, ignore_errors=True)
+
+
 def checkout(
     repo_url: str,
     sha: str,
@@ -690,23 +769,40 @@ def checkout(
 ) -> None:
     """
     Checkout the exact PR head commit.
-
-    Compatible with current main.py:
-        checkout(repo_url, sha, root)
-
-    Also supports PR refs when pr_number is supplied.
+    Supports high-speed direct PR ref fetch (pull/<pr>/head) to avoid cloning unrelated branches.
     """
-
     destination = destination.resolve()
 
     if destination.exists():
-        shutil.rmtree(destination)
+        _safe_rmtree(destination)
 
     destination.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
 
+    # Strategy 1: Ultra-fast direct shallow PR fetch (10x faster, avoids cloning default branch)
+    if pr_number is not None:
+        init_code, _ = run_process(["git", "init", str(destination)], destination.parent, 30)
+        if init_code == 0:
+            remote_code, _ = run_process(["git", "remote", "add", "origin", repo_url], destination, 30)
+            if remote_code == 0:
+                refspec = f"pull/{pr_number}/head:refs/remotes/origin/healforge-pr-{pr_number}"
+                fetch_code, fetch_out = run_process(
+                    ["git", "fetch", "--depth", "1", "--no-tags", "origin", refspec],
+                    destination,
+                    180,
+                )
+                if fetch_code == 0:
+                    target = f"refs/remotes/origin/healforge-pr-{pr_number}"
+                    co_code, co_out = run_process(["git", "checkout", "--detach", target], destination, 60)
+                    if co_code == 0:
+                        return
+        # If direct PR fetch failed, clean up and fall back to standard clone
+        _safe_rmtree(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+
+    # Strategy 2: Single-branch shallow clone
     code, output = run_process(
         [
             "git",
@@ -714,12 +810,12 @@ def checkout(
             "--no-tags",
             "--depth",
             "1",
-            "--no-single-branch",
+            "--single-branch",
             repo_url,
             str(destination),
         ],
         destination.parent,
-        180,
+        300,
     )
 
     if code != 0:
@@ -795,6 +891,136 @@ def checkout(
         )
 
 
+def prepare_attempt_workspace(
+    repo_url: str,
+    sha: str,
+    session_dir: Path,
+    attempt: int,
+    pr_number: int | None = None,
+    checkout_fn=checkout,
+) -> Path:
+    """
+    Ensure an immutable clean snapshot 'base_repo' exists for this session.
+    Then create an isolated, disposable copy for attempt-{attempt}.
+
+    Guarantees:
+    1. Network git clone happens AT MOST ONCE per session.
+    2. Every attempt directory starts from the pristine, unmutated 'base_repo'.
+    3. Attempt N never contains any patches or build artifacts from Attempt N-1.
+    4. Uses git worktree for near-instant zero-copy workspace isolation when .git is present.
+    """
+    session_dir = session_dir.resolve()
+    base_repo = session_dir / "base_repo"
+    attempt_dir = session_dir / f"attempt-{attempt}"
+
+    # Fetch clean base_repo snapshot once
+    if not base_repo.exists() or not (base_repo / ".git").exists():
+        try:
+            if pr_number is not None:
+                checkout_fn(repo_url, sha, base_repo, pr_number=pr_number)
+            else:
+                checkout_fn(repo_url, sha, base_repo)
+        except TypeError:
+            checkout_fn(repo_url, sha, base_repo)
+
+    # Always wipe any pre-existing attempt directory
+    if attempt_dir.exists():
+        _safe_rmtree(attempt_dir)
+
+    # Fast path: instant zero-copy worktree isolation if base_repo is a git repository
+    if (base_repo / ".git").is_dir():
+        run_process(["git", "worktree", "prune"], base_repo, 15)
+        code, _ = run_process(
+            ["git", "worktree", "add", "--force", "--detach", str(attempt_dir), "HEAD"],
+            base_repo,
+            30,
+        )
+        if code == 0 and attempt_dir.exists():
+            return attempt_dir
+
+    import stat
+    def _safe_copy2(src, dst, *args, **kwargs):
+        try:
+            if os.path.exists(dst):
+                try:
+                    os.chmod(dst, stat.S_IWRITE)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return shutil.copy2(src, dst, *args, **kwargs)
+
+    # Fallback to copytree (e.g. for mock test workspaces without .git)
+    shutil.copytree(base_repo, attempt_dir, symlinks=False, dirs_exist_ok=True, copy_function=_safe_copy2)
+    return attempt_dir
+
+
+def summarize_verification_failure(
+    output: str,
+    exit_code: int | None = None,
+    command: str = "",
+) -> str:
+    """
+    Extract concise, actionable failure evidence for AI recovery:
+    - Exit code and failed command
+    - Specific failing test names
+    - Tracebacks, compiler errors, or assertion failures
+    Truncates noise while preserving diagnostic signals.
+    """
+    if not output:
+        return f"Command `{command}` failed with exit code {exit_code} (no output)."
+
+    clean_out = output.strip()
+    lines = clean_out.splitlines()
+
+    failing_tests: list[str] = []
+    tracebacks: list[str] = []
+    error_lines: list[str] = []
+
+    for line in lines:
+        m = re.search(r"(?:FAILED|FAIL:|ERROR:|FAILURE:)\s+([^\s]+)", line)
+        if m:
+            failing_tests.append(m.group(1))
+
+    in_traceback = False
+    current_tb: list[str] = []
+    for line in lines:
+        if "Traceback (most recent call last):" in line or "FAILURES ===" in line:
+            in_traceback = True
+            current_tb = [line]
+            continue
+        if in_traceback:
+            current_tb.append(line)
+            if len(current_tb) > 50:
+                tracebacks.append("\n".join(current_tb))
+                current_tb = []
+                in_traceback = False
+        elif any(kw in line.lower() for kw in ("assertionerror", "syntaxerror", "typeerror", "valueerror", "failed")):
+            if len(error_lines) < 20:
+                error_lines.append(line)
+
+    if current_tb:
+        tracebacks.append("\n".join(current_tb))
+
+    parts = [f"FAILED COMMAND: {command} (exit code: {exit_code})"]
+    if failing_tests:
+        unique_fails = list(dict.fromkeys(failing_tests))[:10]
+        parts.append("FAILING TESTS:\n" + "\n".join(f"- {t}" for t in unique_fails))
+
+    if tracebacks:
+        parts.append("RELEVANT TRACEBACK / FAILURE OUTPUT:\n" + "\n\n".join(tracebacks[-2:]))
+    elif error_lines:
+        parts.append("KEY ERROR LINES:\n" + "\n".join(error_lines[:15]))
+    else:
+        tail = "\n".join(lines[-35:])
+        parts.append("OUTPUT TAIL:\n" + tail)
+
+    summary = "\n\n".join(parts)
+    if len(summary) > 4000:
+        summary = summary[:4000] + "\n... [truncated]"
+    return summary
+
+
 # ============================================================================
 # PATCH SAFETY
 # ============================================================================
@@ -858,6 +1084,31 @@ def apply_patch(
     )
 
     if code != 0:
+        # Fallback: try 3-way merge if standard check failed
+        code_3way, _ = run_process(
+            [
+                "git",
+                "apply",
+                "--3way",
+                "--check",
+                str(patch_file),
+            ],
+            root,
+            30,
+        )
+        if code_3way == 0:
+            code_apply, out_apply = run_process(
+                [
+                    "git",
+                    "apply",
+                    "--3way",
+                    "--whitespace=nowarn",
+                    str(patch_file),
+                ],
+                root,
+                30,
+            )
+            return code_apply == 0, out_apply
         return False, output
 
     code, output = run_process(
@@ -943,9 +1194,29 @@ def _copy_build_context(
 
 def _dockerfile_for(
     profile: ProjectProfile,
+    root: Path | None = None,
 ) -> str:
 
     if profile.language == "python":
+        has_setup = (
+            "setup.py" in profile.evidence
+            or "setup.cfg" in profile.evidence
+            or "pyproject.toml" in profile.evidence
+            or (root is not None and ((root / "setup.py").exists() or (root / "setup.cfg").exists() or (root / "pyproject.toml").exists()))
+        )
+        has_reqs = "requirements.txt" in profile.evidence or (root is not None and (root / "requirements.txt").exists())
+        has_reqs_dev = "requirements-dev.txt" in profile.evidence or (root is not None and (root / "requirements-dev.txt").exists())
+        has_c_files = root is not None and (any(root.glob("**/*.c")) or any(root.glob("**/*.cpp")))
+
+        needs_build_tools = has_setup or has_c_files
+        sys_install = (
+            "RUN apt-get update && apt-get install -y --no-install-recommends "
+            "build-essential git && "
+            "rm -rf /var/lib/apt/lists/*\n\n"
+            if needs_build_tools
+            else ""
+        )
+
 
         if profile.package_manager == "uv":
             install = (
@@ -968,10 +1239,18 @@ def _dockerfile_for(
                 "pipenv install --dev"
             )
 
-        elif (
-            "requirements.txt"
-            in profile.evidence
-        ):
+        elif has_setup:
+            parts = []
+            if has_reqs:
+                parts.append("python -m pip install --no-cache-dir -r requirements.txt")
+            if has_reqs_dev:
+                parts.append("python -m pip install --no-cache-dir -r requirements-dev.txt")
+            # Generic build tools only — no project-specific packages
+            parts.append("python -m pip install --no-cache-dir setuptools wheel pip --upgrade")
+            parts.append("python -m pip install --no-cache-dir -e . || python -m pip install --no-cache-dir --no-build-isolation -e .")
+            install = " && ".join(parts)
+
+        elif has_reqs:
             install = (
                 "python -m pip install "
                 "--no-cache-dir "
@@ -981,18 +1260,18 @@ def _dockerfile_for(
         else:
             install = "true"
 
+        pytest_step = "" if has_setup else "RUN python -m pip install --no-cache-dir pytest\n"
+
         return f"""
 FROM {profile.docker_image}
 
-WORKDIR /opt/healforge-repo
+{sys_install}WORKDIR /opt/healforge-repo
 
 COPY . /opt/healforge-repo
 
 RUN {install}
 
-RUN python -m pip install --no-cache-dir pytest
-
-# Runtime verification copies the immutable repository into a disposable
+{pytest_step}# Runtime verification copies the immutable repository into a disposable
 # writable workspace before executing the test command.
 # cp -a /opt/healforge-repo/. /work/
 # cd /work
@@ -1137,8 +1416,67 @@ CMD ["sh", "-lc", "{profile.test_command}"]
 
 
 # ============================================================================
-# CONTENT FINGERPRINT
 # ============================================================================
+# CONTENT & DEPENDENCY FINGERPRINT
+# ============================================================================
+
+def _dependency_fingerprint(
+    root: Path,
+    profile: ProjectProfile,
+) -> str:
+    """
+    Hash dependency manifests and base environment configuration.
+    Source edits alone do not invalidate the base image, allowing instant
+    Docker image reuse across repair attempts.
+    """
+    digest = hashlib.sha256()
+    digest.update(profile.language.encode())
+    digest.update(profile.package_manager.encode())
+    digest.update(profile.docker_image.encode())
+
+    manifest_names = {
+        "requirements.txt", "requirements-dev.txt", "pyproject.toml",
+        "setup.py", "setup.cfg", "Pipfile", "Pipfile.lock", "poetry.lock", "uv.lock",
+        "tox.ini", "noxfile.py",
+        "package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock",
+        "pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", "gradle.properties",
+        "go.mod", "go.sum", "Cargo.toml", "Cargo.lock", "CMakeLists.txt", "Makefile",
+    }
+
+    found_files: set[Path] = set()
+    for name in manifest_names:
+        p = root / name
+        if p.is_file():
+            found_files.add(p)
+
+    try:
+        for p in root.glob("requirements*.txt"):
+            if p.is_file():
+                found_files.add(p)
+    except OSError:
+        pass
+
+    if (root / "requirements").is_dir():
+        try:
+            for p in (root / "requirements").glob("*.txt"):
+                if p.is_file():
+                    found_files.add(p)
+        except OSError:
+            pass
+
+    if not found_files:
+        return _content_fingerprint(root)
+
+    for p in sorted(found_files, key=lambda x: x.as_posix()):
+        try:
+            rel = p.relative_to(root).as_posix()
+            digest.update(rel.encode())
+            digest.update(p.read_bytes())
+        except (OSError, ValueError):
+            pass
+
+    return digest.hexdigest()[:16]
+
 
 def _content_fingerprint(
     root: Path,
@@ -1194,15 +1532,25 @@ def _build_sandbox_image(
             "Start Docker Desktop and retry.",
         )
 
-    fingerprint = _content_fingerprint(
-        root
+    fingerprint = _dependency_fingerprint(
+        root,
+        profile,
     )
 
     image_tag = (
-        f"healforge-sandbox-"
+        f"healforge-base-"
         f"{profile.language}-"
         f"{fingerprint}:latest"
     )
+
+    # Fast path: check if immutable base environment already exists locally
+    inspect_code, _ = run_process(
+        ["docker", "image", "inspect", image_tag],
+        root,
+        10,
+    )
+    if inspect_code == 0:
+        return True, image_tag
 
     with tempfile.TemporaryDirectory(
         prefix="healforge-build-"
@@ -1232,7 +1580,7 @@ def _build_sandbox_image(
         )
 
         dockerfile.write_text(
-            _dockerfile_for(profile),
+            _dockerfile_for(profile, root),
             encoding="utf-8",
         )
 
@@ -1275,12 +1623,48 @@ def _build_sandbox_image(
 
 
 # ============================================================================
+# SANDBOX PRE-FLIGHT VALIDATION
+# ============================================================================
+
+def _validate_sandbox_environment(
+    image: str,
+    profile: ProjectProfile,
+) -> tuple[bool, str]:
+    """
+    Lightweight pre-flight validation of the sandbox container before running tests.
+    Ensures language interpreter/compiler and runtime dependencies are available.
+    """
+    if profile.language == "python":
+        check_cmd = "python3 -c \"import sys; import pytest; print('ENV_OK')\""
+    elif profile.language == "node":
+        check_cmd = "node -e \"console.log('ENV_OK')\""
+    elif profile.language == "go":
+        check_cmd = "go version"
+    elif profile.language == "rust":
+        check_cmd = "cargo --version"
+    elif profile.language == "java":
+        check_cmd = "java -version"
+    else:
+        check_cmd = "sh -c 'echo ENV_OK'"
+
+    code, output = run_process(
+        ["docker", "run", "--rm", "--network", "none", image, "sh", "-lc", check_cmd],
+        Path.cwd(),
+        15,
+    )
+    if code != 0:
+        return False, f"ENVIRONMENT NOT READY: Pre-flight environment validation failed.\n{output}"
+    return True, ""
+
+
+# ============================================================================
 # SANDBOX RUNTIME
 # ============================================================================
 
 def _run_sandbox(
     image: str,
     command: str,
+    repo_dir: Path | None = None,
 ) -> RunResult:
 
     timeout = getattr(
@@ -1289,37 +1673,40 @@ def _run_sandbox(
         180,
     )
 
-    safe_command = (
-        command
-        .replace(
-            "'",
-            "'\"'\"'",
-        )
-    )
-
     runtime_command = command
 
-    if command == "pytest -q":
-        runtime_command = "pytest -q -p no:cacheprovider"
-
-    elif command == "python -m pytest -q":
-        runtime_command = "python -m pytest -q -p no:cacheprovider"
-
-    elif command == "gradle test":
+    # The detection layer already appends -p no:cacheprovider for
+    # pytest projects, so no special-casing is needed here.  Only
+    # add --no-daemon for bare gradle commands that lack it.
+    if command == "gradle test":
         runtime_command = "gradle test --no-daemon"
+    elif "pytest" in runtime_command and "-W " not in runtime_command:
+        runtime_command = runtime_command.replace("pytest", "pytest -W default")
 
     safe_command = (
         runtime_command
         .replace("'", "'\"'\"'")
     )
 
+    # Fast disposable copy: bypass copying .git across Windows mount mounts
     runtime_script = (
         "set -eu; "
         "mkdir -p /work; "
-        "cp -a /opt/healforge-repo/. /work/; "
+        "(cd /opt/healforge-repo && tar --exclude=.git -cf - .) | (cd /work && tar --no-same-owner --no-same-permissions -xf -); "
+        "chmod -R u+w /work; "
+        "if [ -d /opt/healforge-overlay ]; then "
+        "(cd /opt/healforge-overlay && tar --exclude=.git -cf - .) | (cd /work && tar --no-same-owner --no-same-permissions -xf -); "
+        "chmod -R u+w /work; "
+        "fi; "
         "cd /work; "
+        "export PYTHONPATH=/work/lib:/work/src:/work:${PYTHONPATH:-}; "
         f"exec sh -lc '{safe_command}'"
     )
+
+    volume_args: list[str] = []
+    if repo_dir is not None and repo_dir.exists():
+        host_path = str(repo_dir.resolve()).replace("\\", "/")
+        volume_args = ["-v", f"{host_path}:/opt/healforge-overlay:ro"]
 
     args = [
         "docker",
@@ -1329,6 +1716,8 @@ def _run_sandbox(
         # No network during verification.
         "--network",
         "none",
+
+        *volume_args,
 
         # Resource limits.
         "--cpus",
@@ -1353,11 +1742,13 @@ def _run_sandbox(
 
         # Writable disposable workspace.
         "--tmpfs",
-        "/work:rw,nosuid,nodev,size=512m",
+        "/work:rw,exec,nosuid,nodev,size=512m",
 
-        # Writable temporary directory but no executable files.
+        # Writable temporary directory for runtimes that execute temp files
+        # (Java, Go, Rust).  The container is already hardened by --cap-drop
+        # ALL, --read-only, --network none, and no-new-privileges.
         "--tmpfs",
-        "/tmp:rw,noexec,nosuid,nodev,size=256m",
+        "/tmp:rw,exec,nosuid,nodev,size=256m",
 
         image,
 
@@ -1372,12 +1763,14 @@ def _run_sandbox(
         timeout,
     )
 
-    return RunResult(
+    result = RunResult(
         passed=code == 0,
         command=command,
         exit_code=code,
         output=output,
     )
+    result.category = classify_failure(result)
+    return result
 
 
 # ============================================================================
@@ -1411,14 +1804,30 @@ def docker_test(
     )
 
     if not ready:
-        return RunResult(
+        res = RunResult(
             passed=False,
             command=profile.test_command,
             exit_code=1,
             output=image_or_error,
         )
+        res.category = classify_failure(res)
+        return res
+
+    valid, val_error = _validate_sandbox_environment(image_or_error, profile)
+    if not valid:
+        res = RunResult(
+            passed=False,
+            command="preflight_validation",
+            exit_code=1,
+            output=val_error,
+            category="ENVIRONMENT_FAILURE",
+        )
+        return res
+
+    test_cmd = command.strip() if command and command.strip() else profile.test_command
 
     return _run_sandbox(
         image_or_error,
-        profile.test_command,
+        test_cmd,
+        repo_dir=root,
     )

@@ -1,20 +1,37 @@
 import asyncio
+import json
 import logging
+import os
 import re
 import secrets
+import tempfile
+import time
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from .ai import AIEngine
+from .ai import AIEngine, AIQuotaExhaustedError, AIModelRateLimitError
 from .config import settings
 from .context import build_context, is_sensitive_path
 from .security import is_safe_repo_path, normalize_repo_path
 from .github import GitHubClient, RepoRef, parse_pr_url
-from .runner import apply_patch, checkout, detect_project, docker_test, validate_patch_paths
+from .runner import (
+    apply_patch,
+    checkout,
+    classify_failure,
+    detect_project,
+    detect_project_profile,
+    docker_test,
+    prepare_attempt_workspace,
+    summarize_verification_failure,
+    validate_patch_paths,
+    ProjectProfile,
+)
 from .schemas import AnalyzeRequest, InspectRequest, PublishRequest, RepairRequest
+from .verifier import get_verifier, VerificationResult, UnavailableVerifier
 
 
 app = FastAPI(title="HEALFORGE", version="2.0.0")
@@ -23,15 +40,108 @@ SESSIONS: dict[str, dict] = {}
 logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
+# Lightweight AI status tracking (Directive 10)
+# Tracks availability without calling the model or wasting quota on health checks.
+_AI_STATUS_CACHE: dict[str, Any] = {
+    "status": "AVAILABLE",
+    "reset_timestamp": None,
+    "remedy_hint": None,
+    "last_checked_at": 0.0,
+    "message": None,
+}
+
+
+def record_ai_success() -> None:
+    _AI_STATUS_CACHE["status"] = "AVAILABLE"
+    _AI_STATUS_CACHE["reset_timestamp"] = None
+    _AI_STATUS_CACHE["remedy_hint"] = None
+    _AI_STATUS_CACHE["last_checked_at"] = time.time()
+    _AI_STATUS_CACHE["message"] = None
+
+
+def record_ai_quota_exhausted(
+    reset_ts: str | None = None,
+    hint: str | None = None,
+    message: str | None = None,
+) -> None:
+    _AI_STATUS_CACHE["status"] = "DAILY_QUOTA_EXHAUSTED"
+    _AI_STATUS_CACHE["reset_timestamp"] = reset_ts
+    _AI_STATUS_CACHE["remedy_hint"] = hint
+    _AI_STATUS_CACHE["last_checked_at"] = time.time()
+    provider = getattr(settings, "ai_provider", "AI").capitalize()
+    _AI_STATUS_CACHE["message"] = message or f"{provider} daily quota is exhausted."
+
+
+def record_ai_temporarily_unavailable(message: str | None = None) -> None:
+    _AI_STATUS_CACHE["status"] = "TEMPORARILY_UNAVAILABLE"
+    _AI_STATUS_CACHE["last_checked_at"] = time.time()
+    _AI_STATUS_CACHE["message"] = message or "AI service is temporarily unavailable."
+
+
+def check_ai_quota_status() -> None:
+    """Raise HTTP 429 if the daily quota is known to be currently exhausted without expiring."""
+    if _AI_STATUS_CACHE["status"] == "DAILY_QUOTA_EXHAUSTED":
+        reset_ts = _AI_STATUS_CACHE.get("reset_timestamp")
+        if reset_ts:
+            try:
+                if float(reset_ts) <= time.time():
+                    _AI_STATUS_CACHE["status"] = "AVAILABLE"
+                    return
+            except (ValueError, TypeError):
+                pass
+        elif time.time() - _AI_STATUS_CACHE.get("last_checked_at", 0) > 3600:
+            _AI_STATUS_CACHE["status"] = "AVAILABLE"
+            return
+
+        provider = getattr(settings, "ai_provider", "openrouter").capitalize()
+        raise HTTPException(
+            429,
+            detail={
+                "error": "AI_QUOTA_EXHAUSTED",
+                "message": f"{provider} free-model daily quota is exhausted. No repair request was attempted further to avoid wasting quota.",
+                "reset_timestamp": _AI_STATUS_CACHE.get("reset_timestamp"),
+                "remedy_hint": _AI_STATUS_CACHE.get("remedy_hint"),
+            },
+        )
+
 
 def _workspace_root() -> Path:
+    if getattr(settings, "is_vercel", False) or bool(os.getenv("VERCEL")):
+        root = Path(tempfile.gettempdir()) / "healforge_workspace"
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
     configured = Path(settings.host_workspace)
     root = (PROJECT_ROOT / configured).resolve() if not configured.is_absolute() else configured.resolve()
     try:
         root.relative_to(PROJECT_ROOT)
-    except ValueError as exc:
-        raise RuntimeError("HOST_WORKSPACE must remain inside the HEALFORGE project directory") from exc
+        root.mkdir(parents=True, exist_ok=True)
+        test_file = root / ".write_test"
+        test_file.touch()
+        test_file.unlink()
+    except (ValueError, OSError, PermissionError):
+        root = Path(tempfile.gettempdir()) / "healforge_workspace"
+        root.mkdir(parents=True, exist_ok=True)
     return root
+
+
+def _save_session(session_id: str, session: dict) -> None:
+    SESSIONS[session_id] = session
+    try:
+        root = _workspace_root()
+        s_dir = root / session_id
+        s_dir.mkdir(parents=True, exist_ok=True)
+        s_path = s_dir / "session.json"
+        serializable = dict(session)
+        if hasattr(serializable.get("ref"), "owner"):
+            serializable["ref"] = {
+                "owner": serializable["ref"].owner,
+                "repo": serializable["ref"].repo,
+                "number": serializable["ref"].number,
+            }
+        s_path.write_text(json.dumps(serializable, default=str), encoding="utf-8")
+    except Exception:
+        pass
 
 
 async def _fetch_contents(gh, ref, paths: list[str], sha: str) -> dict[str, str]:
@@ -54,6 +164,16 @@ async def _fetch_contents(gh, ref, paths: list[str], sha: str) -> dict[str, str]
 def session_or_404(session_id: str) -> dict:
     session = SESSIONS.get(session_id)
     if not session:
+        try:
+            s_path = _workspace_root() / session_id / "session.json"
+            if s_path.exists():
+                session = json.loads(s_path.read_text(encoding="utf-8"))
+                if isinstance(session.get("ref"), dict):
+                    session["ref"] = RepoRef(**session["ref"])
+                SESSIONS[session_id] = session
+        except Exception as exc:
+            logger.warning("Failed to load session %s from disk: %s", session_id, exc)
+    if not session:
         raise HTTPException(404, "Session not found")
     return session
 
@@ -65,12 +185,36 @@ def index():
 
 @app.get("/api/health")
 def health():
+    ai_configured = settings.is_ai_configured
+    ai_status = "NOT_CONFIGURED"
+    if ai_configured:
+        cached_status = _AI_STATUS_CACHE["status"]
+        if cached_status == "DAILY_QUOTA_EXHAUSTED":
+            reset_ts = _AI_STATUS_CACHE.get("reset_timestamp")
+            if reset_ts:
+                try:
+                    if float(reset_ts) <= time.time():
+                        _AI_STATUS_CACHE["status"] = "AVAILABLE"
+                        cached_status = "AVAILABLE"
+                except (ValueError, TypeError):
+                    pass
+        ai_status = cached_status
+
     return {
         "ok": True,
         "github_configured": bool(settings.github_token),
-        "ai_configured": bool(settings.openrouter_api_key),
-        "ai_models": settings.ai_models if settings.openrouter_api_key else [],
+        "ai_configured": ai_configured,
+        "ai_provider": settings.ai_provider,
+        "ai_status": ai_status,
+        "ai_reset_timestamp": _AI_STATUS_CACHE.get("reset_timestamp"),
+        "ai_remedy_hint": _AI_STATUS_CACHE.get("remedy_hint"),
+        "ai_status_message": _AI_STATUS_CACHE.get("message"),
+        "ai_models": settings.ai_models if ai_configured else [],
         "max_repair_attempts": settings.max_repair_attempts,
+        "verifier_type": settings.verifier_type,
+        "verifier_status": settings.verifier_status,
+        "sandbox_provider": settings.sandbox_provider,
+        "is_vercel": settings.is_vercel,
     }
 
 
@@ -170,6 +314,7 @@ def _score_repository_paths(
 
 @app.post("/api/inspect")
 async def inspect(req: InspectRequest):
+    t_start = time.perf_counter()
     try:
         ref = parse_pr_url(req.pr_url)
     except ValueError as exc:
@@ -179,10 +324,14 @@ async def inspect(req: InspectRequest):
     try:
         try:
             pr = await gh.pull_request(ref)
-            head_sha = pr["head"]["sha"]
+            target_sha = (
+                req.base_sha.strip()
+                if req.base_sha and req.base_sha.strip()
+                else pr["head"]["sha"]
+            )
             files, checks_payload = await asyncio.gather(
                 gh.files(ref),
-                gh.checks(ref, head_sha),
+                gh.checks(ref, target_sha),
             )
         except Exception as exc:
             raise HTTPException(502, f"GitHub inspection failed: {str(exc)[:500]}") from exc
@@ -192,7 +341,7 @@ async def inspect(req: InspectRequest):
         # Tree retrieval is useful but should not make a valid PR
         # uninspectable when the tree endpoint is temporarily unavailable.
         try:
-            tree_objects = await gh.tree(ref, head_sha)
+            tree_objects = await gh.tree(ref, target_sha)
         except Exception:
             tree_objects = []
 
@@ -244,7 +393,7 @@ async def inspect(req: InspectRequest):
         for path in changed_paths:
             add(path)
 
-        contents = await _fetch_contents(gh, ref, candidates, head_sha)
+        contents = await _fetch_contents(gh, ref, candidates, target_sha)
 
         for path in ranked:
             add(path)
@@ -277,7 +426,7 @@ async def inspect(req: InspectRequest):
 
         missing = [path for path in candidates if path not in contents]
         contents.update(
-            await _fetch_contents(gh, ref, missing, head_sha)
+            await _fetch_contents(gh, ref, missing, target_sha)
         )
 
         context = build_context(
@@ -288,8 +437,9 @@ async def inspect(req: InspectRequest):
             tree_paths,
         )
 
+        inspect_sec = round(time.perf_counter() - t_start, 3)
         session_id = secrets.token_urlsafe(12)
-        SESSIONS[session_id] = {
+        session_data = {
             "ref": ref,
             "pr": pr,
             "files": files,
@@ -297,9 +447,15 @@ async def inspect(req: InspectRequest):
             "contents": contents,
             "context": context,
             "tree_paths": tree_paths,
+            "target_sha": target_sha,
             "repairs": [],
             "verifications": [],
+            "metrics": {
+                "inspect_seconds": inspect_sec,
+                "repairs": {},
+            },
         }
+        _save_session(session_id, session_data)
 
         return {
             "session_id": session_id,
@@ -307,7 +463,7 @@ async def inspect(req: InspectRequest):
                 "title": pr.get("title"),
                 "number": pr.get("number"),
                 "url": pr.get("html_url"),
-                "head_sha": head_sha,
+                "head_sha": target_sha,
             },
             "files": [
                 {
@@ -328,6 +484,7 @@ async def inspect(req: InspectRequest):
             ],
             "evidence_files": len(contents),
             "context_chars": len(context),
+            "metrics": SESSIONS[session_id]["metrics"],
         }
     finally:
         close = getattr(gh, "aclose", None)
@@ -336,13 +493,34 @@ async def inspect(req: InspectRequest):
 
 @app.post("/api/analyze")
 def analyze(req: AnalyzeRequest):
+    t_start = time.perf_counter()
     session = session_or_404(req.session_id)
+    check_ai_quota_status()
     try:
         diagnosis = AIEngine().diagnose(session["context"])
         session["diagnosis"] = diagnosis
+        _save_session(req.session_id, session)
+        record_ai_success()
+        diag_sec = round(time.perf_counter() - t_start, 3)
+        session.setdefault("metrics", {})["diagnosis_seconds"] = diag_sec
+        diagnosis["metrics"] = session["metrics"]
         return diagnosis
+    except HTTPException:
+        raise
+    except AIQuotaExhaustedError as exc:
+        record_ai_quota_exhausted(reset_ts=exc.reset_timestamp, hint=exc.remedy_hint, message=str(exc))
+        raise HTTPException(
+            429,
+            detail={
+                "error": "AI_QUOTA_EXHAUSTED",
+                "message": str(exc),
+                "reset_timestamp": exc.reset_timestamp,
+                "remedy_hint": exc.remedy_hint,
+            },
+        )
     except Exception as exc:
         logger.exception("AI diagnosis failure")
+        record_ai_temporarily_unavailable(str(exc)[:200])
         raise HTTPException(
             502,
             f"AI diagnosis failed safely: {type(exc).__name__}: {str(exc)[:500]}",
@@ -351,28 +529,68 @@ def analyze(req: AnalyzeRequest):
 
 @app.post("/api/repair")
 def repair(req: RepairRequest):
+    t_start = time.perf_counter()
     session = session_or_404(req.session_id)
     if "diagnosis" not in session:
         raise HTTPException(400, "Run diagnosis first")
+
+    check_ai_quota_status()
 
     feedback = ""
     if req.attempt > 1:
         previous = session.get("verifications", [])
         if previous:
-            feedback = previous[-1].get("output", "") or previous[-1].get("reason", "")
+            last_v = previous[-1]
+            raw_out = last_v.get("output", "") or last_v.get("reason", "")
+            feedback = summarize_verification_failure(
+                output=raw_out,
+                exit_code=last_v.get("exit_code"),
+                command=last_v.get("command", ""),
+            )
 
     try:
-        result = AIEngine().generate_patch(
-            session["context"],
-            session["diagnosis"],
-            session["contents"],
-            feedback,
-        )
+        try:
+            result = AIEngine().generate_patch(
+                session["context"],
+                session["diagnosis"],
+                session["contents"],
+                feedback,
+                previous_repairs=session.get("repairs", []),
+            )
+        except TypeError as t_err:
+            if "previous_repairs" in str(t_err):
+                result = AIEngine().generate_patch(
+                    session["context"],
+                    session["diagnosis"],
+                    session["contents"],
+                    feedback,
+                )
+            else:
+                raise
         result["attempt"] = req.attempt
         session.setdefault("repairs", []).append(result)
+        _save_session(req.session_id, session)
+        record_ai_success()
+        rep_sec = round(time.perf_counter() - t_start, 3)
+        session.setdefault("metrics", {}).setdefault("repairs", {}).setdefault(str(req.attempt), {})["generate_seconds"] = rep_sec
+        result["metrics"] = session["metrics"]
         return result
+    except HTTPException:
+        raise
+    except AIQuotaExhaustedError as exc:
+        record_ai_quota_exhausted(reset_ts=exc.reset_timestamp, hint=exc.remedy_hint, message=str(exc))
+        raise HTTPException(
+            429,
+            detail={
+                "error": "AI_QUOTA_EXHAUSTED",
+                "message": str(exc),
+                "reset_timestamp": exc.reset_timestamp,
+                "remedy_hint": exc.remedy_hint,
+            },
+        )
     except Exception as exc:
         logger.exception("AI repair generation failure")
+        record_ai_temporarily_unavailable(str(exc)[:200])
         raise HTTPException(
             502,
             f"Repair generation failed safely: {type(exc).__name__}: {str(exc)[:500]}",
@@ -381,6 +599,7 @@ def repair(req: RepairRequest):
 
 @app.post("/api/verify")
 def verify(req: RepairRequest):
+    t_start = time.perf_counter()
     session = session_or_404(req.session_id)
     if req.attempt > settings.max_repair_attempts:
         raise HTTPException(
@@ -409,6 +628,7 @@ def verify(req: RepairRequest):
             "stage": "repair",
             "reason": "The AI refused to produce a safe patch.",
             "attempt": req.attempt,
+            "metrics": session.get("metrics", {}),
         }
         session.setdefault("verifications", []).append(result)
         return result
@@ -418,14 +638,41 @@ def verify(req: RepairRequest):
     except RuntimeError:
         raise HTTPException(400, "Repair patch rejected by the safety policy")
 
+    # Early exit if no sandbox is available — avoid cloning untrusted code
+    verifier = get_verifier()
+    if isinstance(verifier, UnavailableVerifier):
+        result = {
+            "passed": False,
+            "stage": "sandbox",
+            "status": "SANDBOX_UNAVAILABLE",
+            "verifier_type": "none",
+            "category": "ENVIRONMENT_FAILURE",
+            "output": verifier.reason,
+            "attempt": req.attempt,
+            "metrics": session.get("metrics", {}),
+        }
+        session.setdefault("verifications", []).append(result)
+        session["verification"] = result
+        _save_session(req.session_id, session)
+        return result
+
     ref: RepoRef = session["ref"]
-    root = _workspace_root() / req.session_id / f"attempt-{req.attempt}"
+    session_dir = _workspace_root() / req.session_id
 
     try:
-        checkout(
+        target_sha = (
+            session.get("target_sha")
+            or session["pr"].get("base", {}).get("sha")
+            or session["pr"]["head"]["sha"]
+        )
+        pr_num = session["pr"].get("number") if isinstance(session.get("pr"), dict) else None
+        root = prepare_attempt_workspace(
             f"https://github.com/{ref.owner}/{ref.repo}.git",
-            session["pr"]["head"]["sha"],
-            root,
+            target_sha,
+            session_dir,
+            req.attempt,
+            checkout_fn=checkout,
+            pr_number=pr_num,
         )
 
         patch_file = root.parent / f"repair-{req.attempt}.patch"
@@ -433,33 +680,88 @@ def verify(req: RepairRequest):
         applied, patch_output = apply_patch(root, patch_file)
 
         if not applied:
+            v_sec = round(time.perf_counter() - t_start, 3)
+            session.setdefault("metrics", {}).setdefault("repairs", {}).setdefault(str(req.attempt), {})["verify_seconds"] = v_sec
             result = {
                 "passed": False,
                 "stage": "patch",
                 "output": patch_output,
+                "category": "PATCH_FAILURE",
                 "attempt": req.attempt,
+                "metrics": session["metrics"],
             }
             session.setdefault("verifications", []).append(result)
             return result
 
-        language, command = detect_project(root)
-        run = docker_test(root, language, command)
+        language, default_command = detect_project(root)
+
+        # Directive 14: Target the relevant regression test first before broader tests
+        test_command = default_command
+        test_files: list[str] = []
+        for f in session.get("files", []):
+            fn = str(f.get("filename", "")).replace("\\", "/")
+            if fn.endswith((".py", ".js", ".ts", ".go", ".rs", ".java")) and ("test" in fn.lower() or "spec" in fn.lower()):
+                test_files.append(fn)
+
+        if not test_files and session.get("diagnosis"):
+            for aff in session["diagnosis"].get("affected_files", []):
+                aff_norm = str(aff).replace("\\", "/")
+                if "test" in aff_norm.lower() or "spec" in aff_norm.lower():
+                    test_files.append(aff_norm)
+
+        if language == "python" and test_files:
+            target_test = test_files[0]
+            if (root / target_test).exists():
+                test_command = f"python -m pytest -q -p no:cacheprovider -W default {target_test}"
+
+        try:
+            profile = detect_project_profile(root)
+        except Exception:
+            profile = ProjectProfile(
+                language=language or "python",
+                framework="pytest" if language == "python" else "generic",
+                package_manager="pip" if language == "python" else "generic",
+                test_command=test_command,
+                docker_image="python:3.11-slim" if language == "python" else "ubuntu:22.04",
+                confidence=0.5,
+                evidence=["inferred"],
+            )
+        verifier = get_verifier()
+        verif_res: VerificationResult = verifier.verify(
+            root=root,
+            profile=profile,
+            command=test_command,
+            patch=patch,
+            files=session.get("contents"),
+        )
+        v_sec = round(time.perf_counter() - t_start, 3)
+        session.setdefault("metrics", {}).setdefault("repairs", {}).setdefault(str(req.attempt), {})["verify_seconds"] = v_sec
         result = {
-            "passed": run.passed,
+            "passed": verif_res.passed,
             "stage": "sandbox",
-            "language": language,
-            "command": run.command,
-            "exit_code": run.exit_code,
-            "output": run.output,
+            "status": verif_res.status,
+            "language": profile.language,
+            "framework": profile.framework,
+            "package_manager": profile.package_manager,
+            "detected_test_command": profile.test_command,
+            "command": verif_res.command or test_command,
+            "exit_code": verif_res.exit_code,
+            "output": verif_res.output,
+            "category": verif_res.category,
+            "verifier_type": verif_res.verifier_type,
+            "detection_evidence": list(profile.evidence),
             "attempt": req.attempt,
             "root": str(root),
+
+            "metrics": session["metrics"],
         }
         session.setdefault("verifications", []).append(result)
         session["verification"] = result
 
-        if run.passed:
+        if verif_res.passed:
             session["verified_patch"] = patch
 
+        _save_session(req.session_id, session)
         return result
     except Exception:
         logger.exception("Unexpected HEALFORGE verification failure")

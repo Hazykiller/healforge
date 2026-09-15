@@ -34,6 +34,8 @@ def is_safe_repo_path(path: str) -> bool:
     normalized = normalize_repo_path(path)
     if not normalized or normalized.startswith("/"):
         return False
+    if "\x00" in normalized:
+        return False
     if re.match(r"^[A-Za-z]:", normalized):
         return False
     parts = PurePosixPath(normalized).parts

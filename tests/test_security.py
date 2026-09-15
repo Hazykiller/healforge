@@ -51,3 +51,24 @@ def test_docker_build_context_excludes_environment_secrets(tmp_path):
     assert not (destination / "private.pem").exists()
     assert not (destination / "signing.key").exists()
     assert (destination / ".env.example").exists()
+
+
+def test_rejects_windows_drive_paths():
+    assert not is_safe_repo_path("D:\\secrets\\key.pem")
+    assert not is_safe_repo_path("C:/Users/admin/.ssh/id_rsa")
+
+
+def test_rejects_null_and_empty_paths():
+    assert not is_safe_repo_path("")
+    assert not is_safe_repo_path("   ")
+    # Path with null byte embedded
+    assert not is_safe_repo_path("src/app\x00.py")
+
+
+def test_sensitive_path_blocks_all_env_variants():
+    """All .env.* variants except .env.example must be blocked."""
+    assert is_sensitive_path(".env")
+    assert is_sensitive_path(".env.local")
+    assert is_sensitive_path(".env.staging")
+    assert is_sensitive_path("config/.env.production")
+    assert not is_sensitive_path(".env.example")

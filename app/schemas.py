@@ -3,6 +3,7 @@ from pydantic import BaseModel, Field
 
 class InspectRequest(BaseModel):
     pr_url: str = Field(min_length=10, max_length=500)
+    base_sha: str | None = Field(default=None, max_length=100)
 
 
 class AnalyzeRequest(BaseModel):

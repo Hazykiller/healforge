@@ -1,85 +1,130 @@
 # HEALFORGE
 
-Autonomous PR reviewer and repair engine for Orchestrate PS #07 — Self-Heal Git.
+**Autonomous PR diagnosis, repair, and sandbox verification.**
 
-HEALFORGE is intentionally an engineering pipeline, not a chatbot wrapper:
+HEALFORGE turns a failing GitHub pull request into an evidence-backed,
+test-verified candidate repair.
 
-1. Pull request metadata, changed files and CI checks are collected from GitHub.
-2. The changed surface is bounded and relevant repository context is assembled.
-3. The AI diagnoses the failure and proposes a minimal unified diff.
-4. The patch is applied to an isolated local checkout.
-5. A deterministic test command is selected from the repository and executed in Docker when available.
-6. Failed repairs are rejected; a second repair attempt can be generated from the new evidence.
-7. A verified patch can be exported and, when write credentials are supplied, a fix branch and PR can be created.
+```text
+GitHub PR
+   ↓
+Repository evidence
+   ↓
+AI diagnosis
+   ↓
+Minimal unified diff
+   ↓
+Isolated Docker verification
+   ↓
+PASS → verified patch
+   │
+   └── FAIL → verification feedback → repair attempt 2
+```
 
-No fake metrics, placeholder results, hard-coded repository data, or fake AI responses are used.
+## Core capabilities
 
-## Requirements
+- GitHub pull-request inspection
+- Paginated PR-file retrieval
+- Git tree inspection
+- CI check and annotation evidence
+- Repository-aware evidence ranking
+- Local-import discovery
+- Test-file discovery
+- OpenRouter model failover
+- Robust JSON normalization
+- Unified-diff validation
+- Multi-file repair support
+- Verification-feedback repair retry
+- Python, Node.js/TypeScript, Java, Go, Rust and C/C++ project detection
+- Docker sandbox verification
+- Sensitive-file and traversal protection
+- Optional verified-PR publishing
 
-- Python 3.11+
-- Git
-- Docker Desktop (strongly recommended; required for safe arbitrary repository test execution)
-- GitHub token with repository contents/pull-request read access; write access is required only to create a fix branch/PR
-- OpenAI-compatible API key
+## AI routing
 
-## Run
+HEALFORGE features generic, dynamic model routing configurable via environment variables:
+
+1. Primary model (default: `openrouter/free` - OpenRouter's dynamic free-model router)
+2. Fallback models (e.g. `nex-agi/nex-n2.5-mini:free`, `cohere/north-mini-code:free`)
+
+You can configure models via `.env` without modifying Python code:
+```bash
+# Set primary model
+OPENROUTER_MODEL=openrouter/free
+
+# Set fallback models (comma-separated)
+OPENROUTER_FALLBACK_MODELS=nex-agi/nex-n2.5-mini:free,cohere/north-mini-code:free
+
+# Or specify a complete prioritized chain:
+# OPENROUTER_MODELS=openrouter/free,nex-agi/nex-n2.5-mini:free,cohere/north-mini-code:free
+```
+
+Model failure classification:
+- **Account Daily Quota Exhausted (`free-models-per-day` / 429)**: Halts immediately to prevent quota waste, caches status, and returns a clean user-facing error with reset time.
+- **Model Rate Limit (429) / Timeout / 404 / Connection Error**: Proceeds directly to the next configured fallback model.
+- **Syntax / Formatting / Test Edit Error**: Bounded normalization attempt.
+
+## Local setup
+
+1. Copy `.env.example` to `.env`.
+2. Put your GitHub and OpenRouter credentials in `.env`.
+3. Create/activate a Python 3.11+ virtual environment.
+4. Install dependencies:
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-Copy-Item .env.example .env
-# edit .env
-uvicorn app.main:app --reload
 ```
 
-Open http://127.0.0.1:8000
+5. Run verification:
 
-Linux/macOS:
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-uvicorn app.main:app --reload
+```powershell
+python -m pytest -q
+python -m compileall -q app
+node --check static/app.js
 ```
 
-## Environment
+6. Start:
 
-`GITHUB_TOKEN` — fine-grained GitHub token.
-`OPENAI_API_KEY` — model API key.
-`OPENAI_MODEL` — model available to your API account. The default is configurable; set it explicitly for your account.
-`MAX_CONTEXT_CHARS` — maximum repository context sent to the model.
-`MAX_PATCH_CHARS` — maximum generated patch size.
-`DOCKER_IMAGE_PYTHON` — sandbox image for Python repositories.
-`DOCKER_IMAGE_NODE` — sandbox image for Node repositories.
-`ALLOW_WRITE_ACTIONS=false` — safety default. Set true only when you want HEALFORGE to create a fix branch/PR.
+```powershell
+python -m uvicorn app.main:app --log-level debug
+```
 
-## What is implemented
+Do not use `--reload` when `workspace/` is being used for sandbox artifacts.
 
-- GitHub PR inspection
-- Changed-file retrieval
-- CI check retrieval
-- Repository checkout at the PR head SHA
-- Language/test-command detection for common Python and Node projects
-- Docker sandbox execution with network disabled and resource limits
-- AI root-cause diagnosis
-- Minimal unified-diff repair generation
-- Patch application and verification
-- One evidence-driven repair retry
-- Dynamic web dashboard
-- Patch download
-- Optional GitHub fix branch + PR creation
+## Docker
 
-## Safety boundary
+Docker Desktop is required for actual sandbox verification.
 
-Never run untrusted repositories directly on the host. HEALFORGE uses Docker with `--network none`, memory/CPU/PID limits, a read-only root filesystem, a temporary writable work directory, and a timeout. Docker is intentionally required for execution of arbitrary repository code.
+The build context is sanitized before Docker sees it. Sensitive files and
+unsafe symlinks are excluded/rejected. The build may need network access to
+prepare third-party dependencies; the actual test execution container runs
+with networking disabled. Runtime repository files are copied into an
+ephemeral writable `/work` tmpfs while the container root remains read-only.
+The sandbox also drops Linux capabilities and enables `no-new-privileges`.
 
-## Suggested demo
+## Write actions
 
-Use a small public repository you control. Create a PR that introduces a deterministic test failure. Paste its PR URL into the dashboard. Show the failure evidence, diagnosis, candidate patch, sandbox verification, and generated PR.
+Publishing is disabled by default. Enable it deliberately with:
 
-## Competition alignment
+```text
+ALLOW_WRITE_ACTIONS=true
+```
 
-Orchestrate requires a real end-to-end product, a central AI component, a polished interface, empirical verification, a public GitHub repository, setup instructions and development history. HEALFORGE is structured around those requirements.
+Only verified patches can be published.
+
+## Testing
+
+The repository includes unit and API-contract tests for:
+
+- AI failover
+- empty model responses
+- diagnosis normalization
+- patch parsing/security
+- evidence construction
+- repository detection
+- sandbox-context secret exclusion
+- FastAPI inspection/diagnosis flow
+- verification-feedback retry plumbing
+
+The development validation suite in this package passes all included tests in
+the offline test environment. Docker execution itself requires Docker Desktop.

@@ -1,0 +1,44 @@
+[
+  {
+    "instance_id": "matplotlib__matplotlib-23751",
+    "language": "python",
+    "inspect_status": "PASS",
+    "diagnosis_status": "FAIL",
+    "repair_status": "SKIPPED",
+    "verification_status": "SKIPPED",
+    "attempts_made": 0,
+    "touched_files": [],
+    "diff_lines": 0,
+    "duration_seconds": 8.6,
+    "passed": false,
+    "error_message": "Analyze failed (502): {\"detail\":\"AI diagnosis failed safely: RuntimeError: All configured AI models returned unusable responses: nvidia/nemotron-3-ultra-550b-a55b:free: BadRequestError: Error code: 400 - {'error': {'message': \\\"'models' array must have 3 items or fewer.\\\", 'code': 400}, 'user_id': 'user_39im7EOJVasYB3vUA"
+  },
+  {
+    "instance_id": "healforge-challenge-python-1",
+    "language": "python",
+    "inspect_status": "PASS",
+    "diagnosis_status": "FAIL",
+    "repair_status": "SKIPPED",
+    "verification_status": "SKIPPED",
+    "attempts_made": 0,
+    "touched_files": [],
+    "diff_lines": 0,
+    "duration_seconds": 3.6,
+    "passed": false,
+    "error_message": "Analyze failed (502): {\"detail\":\"AI diagnosis failed safely: RuntimeError: All configured AI models returned unusable responses: nvidia/nemotron-3-ultra-550b-a55b:free: BadRequestError: Error code: 400 - {'error': {'message': \\\"'models' array must have 3 items or fewer.\\\", 'code': 400}, 'user_id': 'user_39im7EOJVasYB3vUA"
+  },
+  {
+    "instance_id": "psf__requests-2931",
+    "language": "python",
+    "inspect_status": "FAIL",
+    "diagnosis_status": "SKIPPED",
+    "repair_status": "SKIPPED",
+    "verification_status": "SKIPPED",
+    "attempts_made": 0,
+    "touched_files": [],
+    "diff_lines": 0,
+    "duration_seconds": 1.75,
+    "passed": false,
+    "error_message": "Inspect failed (502): {\"detail\":\"GitHub inspection failed: GitHub API 422: {\\\"message\\\":\\\"No commit found for SHA: 27685c48b89e3a6473ca55a909618b14e59df04a\\\",\\\"documentation_url\\\":\\\"https://docs.github.com/rest/checks/runs#list-check-runs-for-a-git-reference\\\",\\\"status\\\":\\\"422\\\"}\"}"
+  }
+]
