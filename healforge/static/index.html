@@ -19,8 +19,9 @@
 <section class="card input-card">
   <div class="section-label">01 / CONNECT</div>
   <label for="prUrl">GitHub pull request</label>
-  <div class="input-row"><input id="prUrl" placeholder="https://github.com/owner/repository/pull/42" autocomplete="off" /><button id="inspect">Inspect PR <span>→</span></button></div>
+  <div class="input-row"><input id="prUrl" placeholder="https://github.com/owner/repository/pull/42" autocomplete="off" /><button id="inspect">Inspect PR <span>→</span></button><button id="newRun" class="secondary" type="button" title="Start a fresh run">New Run</button></div>
   <div id="config" class="hint"></div>
+  <div id="notice" class="notice hidden" role="status" aria-live="polite"></div>
 </section>
 <section id="workspace" class="hidden">
   <div class="grid two">

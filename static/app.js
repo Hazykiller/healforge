@@ -3,6 +3,56 @@ const $ = (id) => document.getElementById(id);
 let sessionId = null;
 let currentStage = "stageInspect";
 let maxRepairAttempts = 2;
+let defaultHealthText = "";
+let defaultHealthColor = "";
+
+function resetWorkspaceUI(keepUrl = false) {
+  sessionId = null;
+  currentStage = "stageInspect";
+  clearError();
+  hideResultCards();
+
+  // Reset stage indicators
+  setStage("stageInspect", "active", keepUrl ? "RUNNING" : "READY");
+  setStage("stageDiagnose", "", "WAITING");
+  setStage("stageRepair", "", "WAITING");
+  setStage("stageVerify", "", "WAITING");
+
+  // Reset Run Recovery button
+  const runBtn = $("runRecovery");
+  if (runBtn) {
+    runBtn.disabled = false;
+    runBtn.textContent = "Run recovery";
+  }
+
+  // Clear evidence pane
+  const prMeta = $("prMeta");
+  if (prMeta) prMeta.innerHTML = "";
+  const fileCount = $("fileCount");
+  if (fileCount) fileCount.textContent = "0";
+  const checkCount = $("checkCount");
+  if (checkCount) checkCount.textContent = "0";
+  const contextChars = $("contextChars");
+  if (contextChars) contextChars.textContent = "0";
+  const files = $("files");
+  if (files) files.innerHTML = "";
+
+  if (!keepUrl) {
+    const input = $("prUrl");
+    if (input) {
+      input.value = "";
+      input.focus();
+    }
+    const workspace = $("workspace");
+    if (workspace) workspace.classList.add("hidden");
+
+    const config = $("config");
+    if (config && defaultHealthText) {
+      config.textContent = defaultHealthText;
+      config.style.color = defaultHealthColor;
+    }
+  }
+}
 
 async function api(path, options = {}) {
   const response = await fetch(path, {
@@ -60,7 +110,7 @@ function setStage(id, state, label) {
   const element = $(id);
   if (!element) return;
 
-  element.className = `stage ${state}`;
+  element.className = `stage ${state}`.trim();
   const status = element.querySelector("em");
   if (status) status.textContent = label;
 }
@@ -91,12 +141,19 @@ async function inspect() {
     return;
   }
 
+  // Refresh everything immediately except the entered link
+  resetWorkspaceUI(true);
+
   const button = $("inspect");
   button.disabled = true;
   button.textContent = "Inspecting…";
   currentStage = "stageInspect";
-  clearError();
-  setStage("stageInspect", "active", "RUNNING");
+
+  const config = $("config");
+  if (config) {
+    config.textContent = "Connecting to GitHub & loading evidence…";
+    config.style.color = "var(--muted)";
+  }
 
   try {
     const data = await api("/api/inspect", {
@@ -110,11 +167,19 @@ async function inspect() {
     renderPullRequest(data);
     $("workspace").classList.remove("hidden");
     setStage("stageInspect", "done", "READY");
-    $("config").textContent =
-      `Evidence loaded · ${data.evidence_files || 0} files · ${Number(data.context_chars || 0).toLocaleString()} chars`;
+    if (config) {
+      config.textContent =
+        `Evidence loaded · ${data.evidence_files || 0} files · ${Number(data.context_chars || 0).toLocaleString()} chars`;
+      config.style.color = "";
+    }
   } catch (error) {
     setStage("stageInspect", "fail", "ERROR");
     showError(error.message);
+    $("workspace")?.classList.add("hidden");
+    if (config && defaultHealthText) {
+      config.textContent = defaultHealthText;
+      config.style.color = defaultHealthColor;
+    }
   } finally {
     button.disabled = false;
     button.innerHTML = 'Inspect PR <span>→</span>';
@@ -176,9 +241,13 @@ async function recover() {
   clearError();
   hideResultCards();
 
+  // Reset stages 2-4 to clean initial state for recovery
+  setStage("stageDiagnose", "active", "RUNNING");
+  setStage("stageRepair", "", "WAITING");
+  setStage("stageVerify", "", "WAITING");
+
   try {
     currentStage = "stageDiagnose";
-    setStage("stageDiagnose", "active", "RUNNING");
     const diagnosis = await api("/api/analyze", {
       method: "POST",
       body: JSON.stringify({ session_id: sessionId })
@@ -262,9 +331,9 @@ function renderDiagnosis(diagnosis) {
       <span class="pill good">${Math.round(confidence * 100)}% confidence${duration}</span>
     </div>
     <div class="kv">
-      <b>Summary</b><span>${escapeHtml(diagnosis.summary)}</span>
-      <b>Root cause</b><span>${escapeHtml(diagnosis.root_cause)}</span>
-      <b>Repair strategy</b><span>${escapeHtml(diagnosis.repair_strategy)}</span>
+      <b>Summary</b><span>${escapeHtml(diagnosis.summary || "Diagnosis complete")}</span>
+      <b>Root cause</b><span>${escapeHtml(diagnosis.root_cause || "Identified from repository evidence")}</span>
+      <b>Repair strategy</b><span>${escapeHtml(diagnosis.repair_strategy || "Synthesizing minimal patch")}</span>
     </div>
     ${evidence.length ? `<div class="hint">Evidence</div><div class="content">${evidence.map((item) => `• ${escapeHtml(item)}`).join("<br>")}</div>` : ""}
   `;
@@ -280,6 +349,12 @@ function renderRepair(repair, attempt) {
       <b>Prior attempt analysis:</b> ${escapeHtml(repair.why_previous_failed)}
     </div>` : "";
 
+  const patchText = (repair.patch || "").trim();
+  const downloadButton = patchText ? `
+    <div class="actions">
+      <a class="secondary" href="/api/session/${encodeURIComponent(sessionId)}/patch">Download patch</a>
+    </div>` : "";
+
   $("patchCard").classList.remove("hidden");
   $("patchCard").innerHTML = `
     <div class="result-title">
@@ -292,10 +367,8 @@ function renderRepair(repair, attempt) {
       <b>Summary</b><span>${escapeHtml(repair.explanation || repair.summary || "Structured repair generated")}</span>
     </div>
     ${whyFailed}
-    <pre class="code" style="margin-top: 12px;">${escapeHtml(repair.patch || "No safe patch generated.")}</pre>
-    <div class="actions">
-      <a class="secondary" href="/api/session/${encodeURIComponent(sessionId)}/patch">Download patch</a>
-    </div>
+    <pre class="code" style="margin-top: 12px;">${escapeHtml(patchText || "No safe patch generated.")}</pre>
+    ${downloadButton}
   `;
 }
 
@@ -333,6 +406,9 @@ function hideResultCards() {
 
 document.addEventListener("DOMContentLoaded", () => {
   $("inspect")?.addEventListener("click", inspect);
+  $("newRun")?.addEventListener("click", () => {
+    resetWorkspaceUI(false);
+  });
   $("runRecovery")?.addEventListener("click", recover);
   $("prUrl")?.addEventListener("keydown", (event) => {
     if (event.key === "Enter") {
@@ -347,14 +423,14 @@ document.addEventListener("DOMContentLoaded", () => {
       if (!config) return;
       const providerName = (health.ai_provider === "gemini") ? "Gemini" : "OpenRouter";
       if (!health.ai_configured) {
-        config.textContent = `${providerName} key missing`;
-        config.style.color = "#ff6b6b";
+        defaultHealthText = `${providerName} key missing`;
+        defaultHealthColor = "#ff6b6b";
       } else if (health.ai_status === "DAILY_QUOTA_EXHAUSTED") {
-        config.textContent = `${providerName} quota exhausted`;
-        config.style.color = "#ffa94d";
+        defaultHealthText = `${providerName} quota exhausted`;
+        defaultHealthColor = "#ffa94d";
       } else if (health.ai_status === "TEMPORARILY_UNAVAILABLE") {
-        config.textContent = `${providerName} status: Temporarily unavailable`;
-        config.style.color = "#ffa94d";
+        defaultHealthText = `${providerName} status: Temporarily unavailable`;
+        defaultHealthColor = "#ffa94d";
       } else {
         const primaryModel = health.ai_models?.[0] || "default";
         let verifierLabel = "Docker (Local)";
@@ -363,9 +439,11 @@ document.addEventListener("DOMContentLoaded", () => {
         } else if (health.verifier_type === "none") {
           verifierLabel = "Sandbox Unavailable";
         }
-        config.textContent = `AI: ${providerName} (${primaryModel}) · VERIFIER: ${verifierLabel}`;
-        config.style.color = "";
+        defaultHealthText = `AI: ${providerName} (${primaryModel}) · VERIFIER: ${verifierLabel}`;
+        defaultHealthColor = "";
       }
+      config.textContent = defaultHealthText;
+      config.style.color = defaultHealthColor;
     })
     .catch((error) => showError(error.message));
 });
