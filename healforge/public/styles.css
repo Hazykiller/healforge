@@ -198,6 +198,11 @@ button:disabled {
   border-color: #4a3032;
 }
 
+.notice.info {
+  color: var(--accent);
+  border-color: #2e4429;
+}
+
 .grid.two {
   display: grid;
   grid-template-columns: minmax(0, 1.25fr) minmax(320px, .75fr);
@@ -319,6 +324,11 @@ button:disabled {
 .pill.good {
   color: var(--accent);
   border-color: #45503a;
+}
+
+.pill.warn {
+  color: #fbbf24;
+  border-color: #5c4515;
 }
 
 .pill.bad {
