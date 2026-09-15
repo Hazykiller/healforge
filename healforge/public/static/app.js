@@ -120,7 +120,18 @@ function showError(message) {
   if (!element) return;
   element.textContent = message;
   element.classList.remove("hidden");
+  element.classList.remove("info");
   element.classList.add("error");
+}
+
+function showNotice(message, type = "info") {
+  const element = $("notice");
+  if (!element) return;
+  element.textContent = message;
+  element.classList.remove("hidden");
+  element.classList.remove("error");
+  element.classList.remove("info");
+  element.classList.add(type);
 }
 
 function clearError() {
@@ -129,6 +140,7 @@ function clearError() {
   element.textContent = "";
   element.classList.add("hidden");
   element.classList.remove("error");
+  element.classList.remove("info");
 }
 
 async function inspect() {
@@ -257,6 +269,7 @@ async function recover() {
 
     const maxAttempts = Math.max(1, Math.min(3, maxRepairAttempts));
     let verified = false;
+    let isSandboxUnavailable = false;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       currentStage = "stageRepair";
@@ -279,10 +292,17 @@ async function recover() {
       });
 
       verified = Boolean(verification.passed);
+      isSandboxUnavailable = verification.status === "SANDBOX_UNAVAILABLE" || verification.verifier_type === "none";
       renderVerification(verification, attempt);
 
       if (verified) {
         setStage("stageVerify", "done", "VERIFIED");
+        break;
+      }
+
+      if (isSandboxUnavailable) {
+        setStage("stageVerify", "done", "PATCH READY");
+        showNotice("Candidate patch generated! Sandbox testing was skipped because Docker Desktop is not running locally. You can review and download the patch below.", "info");
         break;
       }
 
@@ -292,9 +312,9 @@ async function recover() {
       }
     }
 
-    if (!verified) {
+    if (!verified && !isSandboxUnavailable) {
       showError("HEALFORGE could not produce a verified repair after the available attempts.");
-    } else {
+    } else if (verified) {
       clearError();
     }
   } catch (error) {
@@ -374,23 +394,46 @@ function renderRepair(repair, attempt) {
 
 function renderVerification(verification, attempt) {
   const verified = Boolean(verification.passed);
+  const isSandboxUnavailable = verification.status === "SANDBOX_UNAVAILABLE" || verification.verifier_type === "none";
   const duration = verification.metrics?.verify_seconds ? ` · ${verification.metrics.verify_seconds}s` : "";
   const command = escapeHtml(verification.command || "Verification command unavailable");
   const output = escapeHtml(verification.output || verification.reason || "No verification output returned.");
   const exitCode = verification.exit_code == null ? "—" : escapeHtml(verification.exit_code);
 
+  let pillClass = "bad";
+  let pillText = "REJECTED";
+  if (verified) {
+    pillClass = "good";
+    pillText = "VERIFIED";
+  } else if (isSandboxUnavailable) {
+    pillClass = "warn";
+    pillText = "UNVERIFIED (NO DOCKER)";
+  }
+
+  let hintHtml = "";
+  if (verified) {
+    hintHtml = `<div class="actions"><a class="secondary" href="/api/session/${encodeURIComponent(sessionId)}/patch">Download verified patch</a></div>`;
+  } else if (isSandboxUnavailable) {
+    hintHtml = `
+      <div class="hint">The AI successfully synthesized the candidate patch above. Local Docker Desktop is not running, so sandbox execution was skipped. The generated patch is complete and available to download below.</div>
+      <div class="actions" style="margin-top: 10px;"><a class="secondary" href="/api/session/${encodeURIComponent(sessionId)}/patch">Download candidate patch</a></div>
+    `;
+  } else {
+    hintHtml = `<div class="hint">The sandbox rejected this candidate. The next attempt receives this failure output and re-evaluates from clean repository state.</div>`;
+  }
+
   $("verifyCard").classList.remove("hidden");
   $("verifyCard").innerHTML = `
     <div class="result-title">
       <h2>Sandbox verification · attempt ${attempt}</h2>
-      <span class="pill ${verified ? "good" : "bad"}">${verified ? "VERIFIED" : "REJECTED"}${duration}</span>
+      <span class="pill ${pillClass}">${pillText}${duration}</span>
     </div>
     <div class="kv">
       <b>Test command</b><span>${command}</span>
       <b>Exit code</b><span>${exitCode}</span>
     </div>
     <pre class="code">${output}</pre>
-    ${verified ? `<div class="actions"><a class="secondary" href="/api/session/${encodeURIComponent(sessionId)}/patch">Download verified patch</a></div>` : `<div class="hint">The sandbox rejected this candidate. The next attempt receives this failure output and re-evaluates from clean repository state.</div>`}
+    ${hintHtml}
   `;
 }
 

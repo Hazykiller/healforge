@@ -269,6 +269,7 @@ async function recover() {
 
     const maxAttempts = Math.max(1, Math.min(3, maxRepairAttempts));
     let verified = false;
+    let isSandboxUnavailable = false;
 
     for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
       currentStage = "stageRepair";
@@ -291,7 +292,7 @@ async function recover() {
       });
 
       verified = Boolean(verification.passed);
-      const isSandboxUnavailable = verification.status === "SANDBOX_UNAVAILABLE" || verification.verifier_type === "none";
+      isSandboxUnavailable = verification.status === "SANDBOX_UNAVAILABLE" || verification.verifier_type === "none";
       renderVerification(verification, attempt);
 
       if (verified) {
