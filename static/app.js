@@ -400,6 +400,9 @@ function renderVerification(verification, attempt) {
   const output = escapeHtml(verification.output || verification.reason || "No verification output returned.");
   const exitCode = verification.exit_code == null ? "—" : escapeHtml(verification.exit_code);
 
+  const outputRaw = String(verification.output || verification.reason || "");
+  const isServerless = outputRaw.includes("serverless") || outputRaw.includes("cloud");
+
   let pillClass = "bad";
   let pillText = "REJECTED";
   if (verified) {
@@ -407,15 +410,18 @@ function renderVerification(verification, attempt) {
     pillText = "VERIFIED";
   } else if (isSandboxUnavailable) {
     pillClass = "warn";
-    pillText = "UNVERIFIED (NO DOCKER)";
+    pillText = isServerless ? "UNVERIFIED (SERVERLESS)" : "UNVERIFIED (NO DOCKER)";
   }
 
   let hintHtml = "";
   if (verified) {
     hintHtml = `<div class="actions"><a class="secondary" href="/api/session/${encodeURIComponent(sessionId)}/patch">Download verified patch</a></div>`;
   } else if (isSandboxUnavailable) {
+    const envDesc = isServerless
+      ? "Running on serverless cloud (Vercel) without a local Docker daemon. The synthesized patch is complete and ready to download below."
+      : "Docker Desktop is not running locally, so sandbox execution was skipped. The synthesized patch is complete and ready to download below.";
     hintHtml = `
-      <div class="hint">The AI successfully synthesized the candidate patch above. Local Docker Desktop is not running, so sandbox execution was skipped. The generated patch is complete and available to download below.</div>
+      <div class="hint">The AI successfully generated the candidate patch above. ${envDesc}</div>
       <div class="actions" style="margin-top: 10px;"><a class="secondary" href="/api/session/${encodeURIComponent(sessionId)}/patch">Download candidate patch</a></div>
     `;
   } else {
