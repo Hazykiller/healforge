@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>HEALFORGE — Autonomous Software Recovery</title>
+<link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+<div class="shell">
+<header class="topbar">
+  <div class="brand"><span class="mark">H</span><div><strong>HEALFORGE</strong><small>Autonomous Software Recovery</small></div></div>
+</header>
+<main>
+<section class="hero">
+  <h1>Detect. Diagnose.</h1>
+  <h1><span>Fix. Verify.</span></h1>
+  <p>Turn a failing pull request into an evidence-backed, test-verified repair. AI proposes the fix; the sandbox proves it.</p>
+</section>
+<section class="card input-card">
+  <div class="section-label">01 / CONNECT</div>
+  <label for="prUrl">GitHub pull request</label>
+  <div class="input-row"><input id="prUrl" placeholder="https://github.com/owner/repository/pull/42" autocomplete="off" /><button id="inspect">Inspect PR <span>→</span></button><button id="newRun" class="secondary" type="button" title="Start a fresh run">New Run</button></div>
+  <div id="config" class="hint"></div>
+  <div id="notice" class="notice hidden" role="status" aria-live="polite"></div>
+</section>
+<section id="workspace" class="hidden">
+  <div class="grid two">
+    <section class="card">
+      <div class="section-label">02 / EVIDENCE</div>
+      <div id="prMeta"></div>
+      <div class="metric-row"><div><b id="fileCount">0</b><small>changed files</small></div><div><b id="checkCount">0</b><small>CI checks</small></div><div><b id="contextChars">0</b><small>context chars</small></div></div>
+      <div id="files" class="file-list"></div>
+    </section>
+    <section class="card pipeline">
+      <div class="section-label">03 / RECOVERY PIPELINE</div>
+      <div class="stage active" id="stageInspect"><span>01</span><div><b>Repository evidence</b><small>PR diff, checks, changed files</small></div><em>READY</em></div>
+      <div class="stage" id="stageDiagnose"><span>02</span><div><b>AI diagnosis</b><small>Root cause and repair strategy</small></div><em>WAITING</em></div>
+      <div class="stage" id="stageRepair"><span>03</span><div><b>Patch generation</b><small>Minimal unified diff</small></div><em>WAITING</em></div>
+      <div class="stage" id="stageVerify"><span>04</span><div><b>Sandbox verification</b><small>Apply patch, run tests</small></div><em>WAITING</em></div>
+      <button class="primary full" id="runRecovery">Run recovery</button>
+    </section>
+  </div>
+  <section id="diagnosisCard" class="card hidden result-card"></section>
+  <section id="patchCard" class="card hidden result-card"></section>
+  <section id="verifyCard" class="card hidden result-card"></section>
+</section>
+</main>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>

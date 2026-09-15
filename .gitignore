@@ -16,3 +16,4 @@ build/
 target/
 .idea/
 .vscode/
+.vercel
